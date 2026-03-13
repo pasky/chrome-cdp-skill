@@ -48,6 +48,10 @@ scripts/cdp.mjs stop   [target]                   # stop daemon(s)
 
 `<target>` is a unique prefix of the targetId shown by `list`.
 
+## Why not chrome-devtools-mcp?
+
+[chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) reconnects on every command, so Chrome's "Allow debugging" modal can re-appear repeatedly and target enumeration times out with many tabs open. `chrome-cdp` holds one persistent daemon per tab — the modal fires once, and it handles 100+ tabs reliably.
+
 ## How it works
 
 Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. On first access to a tab, a lightweight background daemon is spawned that holds the session open. Chrome's "Allow debugging" modal appears once per tab; subsequent commands reuse the daemon silently. Daemons auto-exit after 20 minutes of inactivity.
