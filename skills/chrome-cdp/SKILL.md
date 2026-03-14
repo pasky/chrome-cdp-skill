@@ -1,6 +1,6 @@
 ---
 name: chrome-cdp
-description: Interact with local Chrome browser session (only on explicit user approval after being asked to inspect, debug, or interact with a page open in Chrome)
+description: Interact with local Chrome browser session (only on explicit user approval after being asked to inspect, debug, or interact with a page open in Chrome). Master daemon architecture means Chrome's Allow popup only fires once per session.
 ---
 
 # Chrome CDP
@@ -12,6 +12,14 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 - Chrome with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
 - Node.js 22+ (uses built-in WebSocket)
 
+## Architecture
+
+A **master daemon** per browser port holds a single WebSocket connection and multiplexes CDP sessions across all tabs. This means:
+- Chrome's "Allow remote debugging?" popup fires **once** per session (when daemon starts)
+- Multiple agents can connect simultaneously via the Unix socket
+- Daemon auto-exits after 20 min idle
+- Socket path: `/tmp/cdp-master-<port>.sock`
+
 ## Commands
 
 All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId prefix from `list`; copy the full prefix shown in the `list` output (for example `6BE827FA`). The CLI rejects ambiguous prefixes.
@@ -20,6 +28,12 @@ All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId pref
 
 ```bash
 scripts/cdp.mjs list
+```
+
+### Open a new tab
+
+```bash
+scripts/cdp.mjs open <url>
 ```
 
 ### Take a screenshot
@@ -55,7 +69,7 @@ scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs stop    [target]               # stop daemon(s)
+scripts/cdp.mjs stop    [target]               # stop master daemon (or detach a tab)
 ```
 
 ## Coordinates
@@ -72,4 +86,17 @@ CSS px = screenshot image px / DPR
 
 - Prefer `snap --compact` over `html` for page structure.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
-- Chrome shows an "Allow debugging" modal once per tab on first access. A background daemon keeps the session alive so subsequent commands need no further approval. Daemons auto-exit after 20 minutes of inactivity.
+- Chrome shows an "Allow debugging" modal once when the master daemon starts. Subsequent commands reuse the connection — no more popups.
+- Only **loaded** tabs appear in `list`. Suspended/discarded tabs are invisible until clicked in the browser.
+
+## Master Daemon IPC
+
+For advanced use / scripting, connect directly to the Unix socket.
+
+Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
+```
+Request:  {"id":<number>, "cmd":"<command>", "targetId":"<optional>", "args":[...]}
+Response: {"id":<number>, "ok":true,  "result":"<string>"}
+       or {"id":<number>, "ok":false, "error":"<message>"}
+```
+Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy, type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods. The socket disappears after 20 min of inactivity.
