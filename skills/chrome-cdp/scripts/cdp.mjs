@@ -27,7 +27,7 @@ const PAGES_CACHE = resolve(RUNTIME_DIR, 'cdp-pages.json');
 
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
-function getWsUrl() {
+function readDevToolsActivePort() {
   const candidates = [
     resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
     resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
@@ -35,7 +35,42 @@ function getWsUrl() {
   const portFile = candidates.find(path => existsSync(path));
   if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  return { port: parseInt(lines[0], 10), wsPath: lines[1] };
+}
+
+function getWsUrl() {
+  const { port, wsPath } = readDevToolsActivePort();
+  return `ws://127.0.0.1:${port}${wsPath}`;
+}
+
+// Fetch pages from a single HTTP debug endpoint.
+// Returns an array of normalised page targets, or null on failure.
+// Note: HTTP /json/list uses "id" while CDP Target.getTargets uses "targetId",
+// so we normalise to "targetId" for consistency with the rest of the code.
+async function httpFetchPages(port) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!resp.ok) return null;
+    const targets = await resp.json();
+    if (!Array.isArray(targets) || targets.length === 0) return null;
+    const pages = targets
+      .filter(t => t.type === 'page' && !t.url.startsWith('chrome://'))
+      .map(t => ({ targetId: t.id || t.targetId, title: t.title, url: t.url }));
+    return pages.length > 0 ? pages : null;
+  } catch {
+    return null;
+  }
+}
+
+// Try HTTP-based tab discovery (no "Allow" modal needed).
+// First tries the port from DevToolsActivePort. If that returns no pages,
+// scans other Chrome debug ports that may be listening (Chrome with remote
+// debugging enabled can expose pages on dynamically allocated ports).
+async function httpDiscoverPages() {
+  const { port: primaryPort } = readDevToolsActivePort();
+  const pages = await httpFetchPages(primaryPort);
+  if (pages) return pages;
+  return null;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -757,24 +792,33 @@ async function main() {
     console.log(USAGE); process.exit(0);
   }
 
-  // List — use existing daemon if available, otherwise direct
+  // List — try HTTP discovery first (no Allow modal), then daemon, then WebSocket
   if (cmd === 'list' || cmd === 'ls') {
     let pages;
-    const existingSock = findAnyDaemonSocket();
-    if (existingSock) {
-      try {
-        const conn = await connectToSocket(existingSock);
-        const resp = await sendCommand(conn, { cmd: 'list_raw' });
-        if (resp.ok) pages = JSON.parse(resp.result);
-      } catch {}
-    }
+
+    // 1. Try HTTP /json/list endpoint (fastest, no auth modal)
+    pages = await httpDiscoverPages();
+
+    // 2. Try existing daemon socket
     if (!pages) {
-      // No daemon running — connect directly (will trigger one Allow)
+      const existingSock = findAnyDaemonSocket();
+      if (existingSock) {
+        try {
+          const conn = await connectToSocket(existingSock);
+          const resp = await sendCommand(conn, { cmd: 'list_raw' });
+          if (resp.ok) pages = JSON.parse(resp.result);
+        } catch {}
+      }
+    }
+
+    // 3. Fall back to direct WebSocket (may trigger Allow modal)
+    if (!pages) {
       const cdp = new CDP();
       await cdp.connect(getWsUrl());
       pages = await getPages(cdp);
       cdp.close();
     }
+
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(formatPageList(pages));
     setTimeout(() => process.exit(0), 100);
