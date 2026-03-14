@@ -760,6 +760,7 @@ async function main() {
   // List — use existing daemon if available, otherwise direct
   if (cmd === 'list' || cmd === 'ls') {
     let pages;
+    let cdpConn; // keep reference so we can reuse for Target.createTarget
     const existingSock = findAnyDaemonSocket();
     if (existingSock) {
       try {
@@ -770,11 +771,28 @@ async function main() {
     }
     if (!pages) {
       // No daemon running — connect directly (will trigger one Allow)
-      const cdp = new CDP();
-      await cdp.connect(getWsUrl());
-      pages = await getPages(cdp);
-      cdp.close();
+      cdpConn = new CDP();
+      await cdpConn.connect(getWsUrl());
+      pages = await getPages(cdpConn);
     }
+
+    // If all tabs are chrome:// pages (not debuggable), auto-create a new blank tab
+    if (pages.length === 0) {
+      if (!cdpConn) {
+        cdpConn = new CDP();
+        await cdpConn.connect(getWsUrl());
+      }
+      process.stderr.write('No debuggable pages found — creating a new tab...\n');
+      const { targetId } = await cdpConn.send('Target.createTarget', { url: 'about:blank' });
+      // Re-fetch pages to include the new tab
+      pages = await getPages(cdpConn);
+      // If getPages still filters it out (about:blank edge case), add it manually
+      if (pages.length === 0 && targetId) {
+        pages = [{ targetId, title: 'New Tab', url: 'about:blank' }];
+      }
+    }
+
+    if (cdpConn) cdpConn.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(formatPageList(pages));
     setTimeout(() => process.exit(0), 100);
