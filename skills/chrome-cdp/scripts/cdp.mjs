@@ -7,7 +7,7 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync, chmodSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -19,12 +19,15 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const SOCK_PREFIX = '/tmp/cdp-';
-const PAGES_CACHE = '/tmp/cdp-pages.json';
+// Use a private runtime directory instead of world-accessible /tmp/
+const RUNTIME_DIR = resolve(homedir(), '.cache', 'cdp');
+try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
+const SOCK_PREFIX = resolve(RUNTIME_DIR, 'cdp-');
+const PAGES_CACHE = resolve(RUNTIME_DIR, 'cdp-pages.json');
 
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
-function getWsUrl() {
+function readDevToolsActivePort() {
   const candidates = [
     resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
     resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
@@ -32,18 +35,55 @@ function getWsUrl() {
   const portFile = candidates.find(path => existsSync(path));
   if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  return { port: parseInt(lines[0], 10), wsPath: lines[1] };
+}
+
+function getWsUrl() {
+  const { port, wsPath } = readDevToolsActivePort();
+  return `ws://127.0.0.1:${port}${wsPath}`;
+}
+
+// Fetch pages from a single HTTP debug endpoint.
+// Returns an array of normalised page targets, or null on failure.
+// Note: HTTP /json/list uses "id" while CDP Target.getTargets uses "targetId",
+// so we normalise to "targetId" for consistency with the rest of the code.
+async function httpFetchPages(port) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!resp.ok) return null;
+    const targets = await resp.json();
+    if (!Array.isArray(targets) || targets.length === 0) return null;
+    const pages = targets
+      .filter(t => t.type === 'page' && !t.url.startsWith('chrome://'))
+      .map(t => ({ targetId: t.id || t.targetId, title: t.title, url: t.url }));
+    return pages.length > 0 ? pages : null;
+  } catch {
+    return null;
+  }
+}
+
+// Try HTTP-based tab discovery (no "Allow" modal needed).
+// First tries the port from DevToolsActivePort. If that returns no pages,
+// scans other Chrome debug ports that may be listening (Chrome with remote
+// debugging enabled can expose pages on dynamically allocated ports).
+async function httpDiscoverPages() {
+  const { port: primaryPort } = readDevToolsActivePort();
+  const pages = await httpFetchPages(primaryPort);
+  if (pages) return pages;
+  return null;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function listDaemonSockets() {
-  return readdirSync('/tmp')
-    .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
-    .map(f => ({
-      targetId: f.slice(4, -5),
-      socketPath: `/tmp/${f}`,
-    }));
+  try {
+    return readdirSync(RUNTIME_DIR)
+      .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
+      .map(f => ({
+        targetId: f.slice(4, -5),
+        socketPath: resolve(RUNTIME_DIR, f),
+      }));
+  } catch { return []; }
 }
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
@@ -278,7 +318,7 @@ async function shotStr(cdp, sid, filePath) {
   }
 
   const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
-  const out = filePath || '/tmp/screenshot.png';
+  const out = filePath || resolve(RUNTIME_DIR, 'screenshot.png');
   writeFileSync(out, Buffer.from(data, 'base64'));
 
   const lines = [out];
@@ -324,6 +364,16 @@ async function waitForDocumentReady(cdp, sid, timeoutMs = NAVIGATION_TIMEOUT) {
 }
 
 async function navStr(cdp, sid, url) {
+  // Only allow http/https to prevent file://, javascript:, data: etc.
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`Blocked navigation to "${parsed.protocol}" URL — only http: and https: are allowed`);
+    }
+  } catch (e) {
+    if (e.message.startsWith('Blocked')) throw e;
+    throw new Error(`Invalid URL: ${url}`);
+  }
   await cdp.send('Page.enable', {}, sid);
   const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
   const result = await cdp.send('Page.navigate', { url }, sid);
@@ -682,7 +732,7 @@ Usage: cdp <command> [args]
   list                              List open pages (shows unique target prefixes)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
+  shot  <target> [file]             Screenshot (default: ~/.cache/cdp/screenshot.png); prints coordinate mapping
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Network performance entries
@@ -717,7 +767,7 @@ EVAL SAFETY NOTE
   collect all data in a single eval.
 
 DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
+  Each tab runs a persistent daemon at Unix socket: ~/.cache/cdp/cdp-<fullTargetId>.sock
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
@@ -742,25 +792,34 @@ async function main() {
     console.log(USAGE); process.exit(0);
   }
 
-  // List — use existing daemon if available, otherwise direct
+  // List — try HTTP discovery first (no Allow modal), then daemon, then WebSocket
   if (cmd === 'list' || cmd === 'ls') {
     let pages;
-    const existingSock = findAnyDaemonSocket();
-    if (existingSock) {
-      try {
-        const conn = await connectToSocket(existingSock);
-        const resp = await sendCommand(conn, { cmd: 'list_raw' });
-        if (resp.ok) pages = JSON.parse(resp.result);
-      } catch {}
-    }
+
+    // 1. Try HTTP /json/list endpoint (fastest, no auth modal)
+    pages = await httpDiscoverPages();
+
+    // 2. Try existing daemon socket
     if (!pages) {
-      // No daemon running — connect directly (will trigger one Allow)
+      const existingSock = findAnyDaemonSocket();
+      if (existingSock) {
+        try {
+          const conn = await connectToSocket(existingSock);
+          const resp = await sendCommand(conn, { cmd: 'list_raw' });
+          if (resp.ok) pages = JSON.parse(resp.result);
+        } catch {}
+      }
+    }
+
+    // 3. Fall back to direct WebSocket (may trigger Allow modal)
+    if (!pages) {
       const cdp = new CDP();
       await cdp.connect(getWsUrl());
       pages = await getPages(cdp);
       cdp.close();
     }
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages));
+
+    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(formatPageList(pages));
     setTimeout(() => process.exit(0), 100);
     return;
