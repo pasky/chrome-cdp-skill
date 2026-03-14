@@ -3,9 +3,10 @@
 // Uses raw CDP over WebSocket, no Puppeteer dependency.
 // Requires Node 22+ (built-in WebSocket).
 //
-// Per-tab persistent daemon: page commands go through a daemon that holds
-// the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// Master daemon architecture: ONE daemon per browser port holds a single
+// WebSocket to the browser, multiplexing CDP sessions across tabs.
+// Chrome's "Allow debugging" modal fires ONCE per master daemon.
+// Daemons auto-exit after 20min idle.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
 import { homedir } from 'os';
@@ -19,31 +20,385 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const SOCK_PREFIX = '/tmp/cdp-';
 const PAGES_CACHE = '/tmp/cdp-pages.json';
+const SESSION_FILE = '/tmp/cdp-session.json';
 
-function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
+function masterSockPath(port) { return `/tmp/cdp-master-${port}.sock`; }
+const CONTEXT_MAP_FILE = '/tmp/cdp-context-profiles.json';
 
-function getWsUrl() {
-  const candidates = [
-    resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-    resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
-  ];
+// Browser profile paths keyed by short name.
+const BROWSER_PROFILES = {
+  chrome: {
+    darwin: 'Library/Application Support/Google/Chrome',
+    linux: '.config/google-chrome',
+  },
+  brave: {
+    darwin: 'Library/Application Support/BraveSoftware/Brave-Browser',
+    linux: '.config/BraveSoftware/Brave-Browser',
+  },
+  edge: {
+    darwin: 'Library/Application Support/Microsoft Edge',
+    linux: '.config/microsoft-edge',
+  },
+  chromium: {
+    darwin: 'Library/Application Support/Chromium',
+    linux: '.config/chromium',
+  },
+  arc: {
+    darwin: 'Library/Application Support/Arc/User Data',
+    linux: null,
+  },
+  dia: {
+    darwin: 'Library/Application Support/Dia/User Data',
+    linux: null,
+  },
+};
+
+const platform = process.platform === 'darwin' ? 'darwin' : 'linux';
+
+function getBrowserCandidates(browserName) {
+  if (browserName) {
+    const key = browserName.toLowerCase();
+    const profile = BROWSER_PROFILES[key];
+    if (!profile) throw new Error(`Unknown browser "${browserName}". Known: ${Object.keys(BROWSER_PROFILES).join(', ')}`);
+    const dir = profile[platform];
+    if (!dir) throw new Error(`Browser "${browserName}" is not supported on ${platform}`);
+    return [resolve(homedir(), dir, 'DevToolsActivePort')];
+  }
+  // Auto-discover: try all browsers
+  return Object.values(BROWSER_PROFILES)
+    .map(p => p[platform])
+    .filter(Boolean)
+    .map(dir => resolve(homedir(), dir, 'DevToolsActivePort'));
+}
+
+// Parsed from argv in main(), set globally for getWsUrl().
+// Priority: CLI flags > env vars > saved session
+let gBrowser = process.env.CDP_BROWSER || null;
+let gPort = process.env.CDP_PORT || null;
+
+function loadSession() {
+  try {
+    const data = JSON.parse(readFileSync(SESSION_FILE, 'utf8'));
+    if (!gBrowser && !gPort) {
+      if (data.browser) gBrowser = data.browser;
+      if (data.port) gPort = data.port;
+    }
+  } catch {}
+}
+
+function saveSession(browser, port) {
+  const data = {};
+  if (browser) data.browser = browser;
+  if (port) data.port = port;
+  writeFileSync(SESSION_FILE, JSON.stringify(data));
+}
+
+function clearSession() {
+  try { unlinkSync(SESSION_FILE); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Profile support — reads Chrome's Local State to map profiles
+// ---------------------------------------------------------------------------
+
+// Get the browser data directory for the current browser.
+function getBrowserDataDir() {
+  const key = (gBrowser || 'chrome').toLowerCase();
+  const profile = BROWSER_PROFILES[key];
+  if (!profile) return null;
+  const dir = profile[platform];
+  return dir ? resolve(homedir(), dir) : null;
+}
+
+// Read all profile names from the browser's Local State file.
+// Returns [{dir: "Default", name: "Work"}, {dir: "Profile 2", name: "Casual Me"}, ...]
+function readProfiles() {
+  const dataDir = getBrowserDataDir();
+  if (!dataDir) return [];
+  const localStatePath = resolve(dataDir, 'Local State');
+  try {
+    const state = JSON.parse(readFileSync(localStatePath, 'utf8'));
+    const cache = state?.profile?.info_cache || {};
+    return Object.entries(cache).map(([dir, info]) => ({
+      dir,
+      name: info.name || dir,
+      gaia: info.gaia_name || '',
+    }));
+  } catch { return []; }
+}
+
+// Build/update the browserContextId → profile name mapping.
+// We discover mappings by seeing which contexts exist for pages.
+// Saved to a temp file so it persists across CLI invocations.
+function loadContextMap() {
+  try { return JSON.parse(readFileSync(CONTEXT_MAP_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function saveContextMap(map) {
+  writeFileSync(CONTEXT_MAP_FILE, JSON.stringify(map));
+}
+
+// Given pages with browserContextId and the known profiles, try to map contexts to profiles.
+// Only the defaultBrowserContextId gets auto-mapped (via Local State's last_used).
+// Other contexts are discovered via the probe mechanism or stay as "?" until identified.
+function updateContextMap(pages, defaultContextId) {
+  const map = loadContextMap();
+  const profiles = readProfiles();
+
+  // Auto-map unmapped contexts to profiles using last_active_profiles order.
+  // Chrome's chrome://inspect toggle doesn't use "default context" meaningfully,
+  // so we map by matching unmapped contexts to unmapped active profiles in order.
+  const dataDir = getBrowserDataDir();
+  if (dataDir && profiles.length > 0) {
+    try {
+      const state = JSON.parse(readFileSync(resolve(dataDir, 'Local State'), 'utf8'));
+      const lastActive = state?.profile?.last_active_profiles || [];
+      const alreadyMappedNames = new Set(Object.values(map).filter(Boolean));
+
+      // Count pages per context to prioritize (contexts with pages are real profiles)
+      const contextPageCount = {};
+      for (const p of pages) {
+        contextPageCount[p.browserContextId] = (contextPageCount[p.browserContextId] || 0) + 1;
+      }
+
+      // Get unmapped contexts that have pages, sorted by page count desc
+      const unmappedContexts = Object.entries(contextPageCount)
+        .filter(([ctx]) => !map[ctx] || map[ctx] === null)
+        .sort((a, b) => b[1] - a[1])
+        .map(([ctx]) => ctx);
+
+      // Get unmapped active profiles in order
+      const unmappedProfiles = lastActive
+        .map(dir => profiles.find(p => p.dir === dir))
+        .filter(p => p && !alreadyMappedNames.has(p.name));
+
+      // Assign in order: most-tabs context → first unmapped active profile
+      for (let i = 0; i < Math.min(unmappedContexts.length, unmappedProfiles.length); i++) {
+        map[unmappedContexts[i]] = unmappedProfiles[i].name;
+      }
+    } catch {}
+  }
+
+  // Register unknown contexts but don't guess their profile — leave as null
+  const knownContexts = new Set(Object.keys(map));
+  const contextIds = new Set(pages.map(p => p.browserContextId));
+  for (const ctx of contextIds) {
+    if (!knownContexts.has(ctx)) {
+      map[ctx] = null; // unknown — discover via `list --profile` or probe
+    }
+  }
+
+  saveContextMap(map);
+  return map;
+}
+
+// Resolve a profile name or dir to a profile directory.
+function resolveProfileDir(nameOrDir) {
+  const profiles = readProfiles();
+  const lower = nameOrDir.toLowerCase();
+  // Exact match on dir
+  const byDir = profiles.find(p => p.dir.toLowerCase() === lower);
+  if (byDir) return byDir;
+  // Match on name (case-insensitive)
+  const byName = profiles.filter(p => p.name.toLowerCase() === lower);
+  if (byName.length === 1) return byName[0];
+  // Prefix match on name
+  const byPrefix = profiles.filter(p => p.name.toLowerCase().startsWith(lower));
+  if (byPrefix.length === 1) return byPrefix[0];
+  if (byPrefix.length > 1) throw new Error(`Ambiguous profile "${nameOrDir}" — matches: ${byPrefix.map(p => p.name).join(', ')}`);
+  throw new Error(`Unknown profile "${nameOrDir}". Available: ${profiles.map(p => p.name).join(', ')}`);
+}
+
+// Discover which browserContextId belongs to which profile by opening a temp page
+// in a specific profile and seeing what context it gets.
+async function discoverProfileContext(profileDir, port) {
+  const dataDir = getBrowserDataDir();
+  if (!dataDir) throw new Error('Cannot determine browser data directory');
+
+  // Open a temporary page in the target profile
+  const marker = `cdp-profile-probe-${Date.now()}`;
+  const markerUrl = `data:text/html,<title>${marker}</title>`;
+
+  // Use the OS to open Chrome with the specific profile
+  const browserApp = {
+    chrome: 'Google Chrome', brave: 'Brave Browser', edge: 'Microsoft Edge',
+    chromium: 'Chromium', dia: 'Dia', arc: 'Arc',
+  }[(gBrowser || 'chrome').toLowerCase()] || 'Google Chrome';
+
+  spawn('open', ['-na', browserApp, '--args', `--profile-directory=${profileDir}`, markerUrl], {
+    detached: true, stdio: 'ignore',
+  }).unref();
+
+  // Wait for the probe tab to appear, then read its browserContextId
+  const conn = await getOrStartMasterDaemon(port);
+  for (let i = 0; i < 20; i++) {
+    await sleep(500);
+    const resp = await sendCommand(await getOrStartMasterDaemon(port), { cmd: 'list_raw' });
+    if (!resp.ok) continue;
+    const pages = JSON.parse(resp.result);
+    const probe = pages.find(p => p.title === marker || p.url.includes(marker));
+    if (probe) {
+      // Found it — record the mapping
+      const map = loadContextMap();
+      const profiles = readProfiles();
+      const profile = profiles.find(p => p.dir === profileDir);
+      map[probe.browserContextId] = profile?.name || profileDir;
+      saveContextMap(map);
+
+      // Close the probe tab
+      try {
+        await sendCommand(await getOrStartMasterDaemon(port), {
+          cmd: 'evalraw', targetId: probe.targetId,
+          args: ['Target.closeTarget', JSON.stringify({ targetId: probe.targetId })]
+        });
+      } catch {}
+
+      return probe.browserContextId;
+    }
+  }
+  throw new Error(`Could not discover context for profile "${profileDir}" — probe tab didn't appear`);
+}
+
+// Discover the default browserContextId from the master daemon.
+async function getDefaultContextId(port) {
+  const conn = await getOrStartMasterDaemon(port);
+  const resp = await sendCommand(conn, { cmd: 'get_default_context' });
+  return resp.ok ? resp.result : null;
+}
+
+// Discover the WebSocket URL by querying the HTTP endpoint on a given port.
+async function discoverWsUrl(port) {
+  const url = `http://127.0.0.1:${port}/json/version`;
+  try {
+    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.webSocketDebuggerUrl || null;
+  } catch { return null; }
+}
+
+// Check if a port is actually listening by attempting a TCP connection.
+async function isPortOpen(port) {
+  const { createConnection } = await import('net');
+  return new Promise((resolve) => {
+    const sock = createConnection({ host: '127.0.0.1', port }, () => {
+      sock.destroy();
+      resolve(true);
+    });
+    sock.on('error', () => resolve(false));
+    sock.setTimeout(2000, () => { sock.destroy(); resolve(false); });
+  });
+}
+
+async function getWsUrl() {
+  // Direct port override
+  if (gPort) {
+    // Try HTTP discovery first (works for Dia, Brave, etc.)
+    const wsUrl = await discoverWsUrl(gPort);
+    if (wsUrl) return wsUrl;
+    // Chrome's chrome://inspect toggle doesn't expose HTTP endpoints,
+    // but the WebSocket works directly. Fall back to generic URL.
+    if (await isPortOpen(gPort)) {
+      return `ws://127.0.0.1:${gPort}/devtools/browser`;
+    }
+    throw new Error(`No CDP server responding on port ${gPort}`);
+  }
+
+  const candidates = getBrowserCandidates(gBrowser);
   const portFile = candidates.find(path => existsSync(path));
-  if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
+  if (!portFile) {
+    const tried = candidates.join('\n  ');
+    const hint = gBrowser
+      ? `Is ${gBrowser} running with remote debugging enabled?`
+      : 'Is any Chromium browser running with remote debugging enabled?';
+    throw new Error(`Could not find DevToolsActivePort file.\n  Tried:\n  ${tried}\n  ${hint}\n  Tip: use --browser <name> or CDP_BROWSER env to target a specific browser (${Object.keys(BROWSER_PROFILES).join(', ')})`);
+  }
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  const filePort = lines[0];
+  const filePath = lines[1];
+
+  // Try HTTP discovery first (gets the fresh WS URL even if file is stale)
+  const wsUrl = await discoverWsUrl(filePort);
+  if (wsUrl) return wsUrl;
+
+  // HTTP failed — port might still be open (Chrome's toggle doesn't expose HTTP)
+  if (await isPortOpen(filePort)) {
+    return `ws://127.0.0.1:${filePort}${filePath}`;
+  }
+
+  // File is stale — try common debug ports as fallback
+  if (gBrowser) {
+    const browserKey = gBrowser.toLowerCase();
+    const defaultPorts = { chrome: 9222, dia: 9223, brave: 9224, edge: 9225, chromium: 9226, arc: 9227 };
+    const fallbackPort = defaultPorts[browserKey];
+    if (fallbackPort && fallbackPort !== parseInt(filePort)) {
+      const fallbackUrl = await discoverWsUrl(fallbackPort);
+      if (fallbackUrl) {
+        process.stderr.write(`Note: DevToolsActivePort was stale (port ${filePort}), found ${gBrowser} on port ${fallbackPort}\n`);
+        return fallbackUrl;
+      }
+      if (await isPortOpen(fallbackPort)) {
+        process.stderr.write(`Note: DevToolsActivePort was stale (port ${filePort}), found ${gBrowser} on port ${fallbackPort}\n`);
+        return `ws://127.0.0.1:${fallbackPort}/devtools/browser`;
+      }
+    }
+  }
+
+  // Last resort: use the file as-is
+  return `ws://127.0.0.1:${filePort}${filePath}`;
+}
+
+// Extract port number from a ws:// URL
+function extractPort(wsUrl) {
+  const m = wsUrl.match(/:(\d+)\//);
+  return m ? m[1] : '9222';
+}
+
+// Resolve the canonical port for the master daemon identity.
+// IMPORTANT: Avoid calling getWsUrl() here — it probes the port via TCP,
+// which Chrome treats as a new debug connection (triggering Allow popup).
+// Instead, read the port from the DevToolsActivePort file without connecting.
+async function resolvePort() {
+  if (gPort) return String(gPort);
+
+  // Try to read port from DevToolsActivePort file (no network connection needed)
+  const candidates = getBrowserCandidates(gBrowser);
+  const portFile = candidates.find(path => existsSync(path));
+  if (portFile) {
+    const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+    return lines[0];
+  }
+
+  // Fallback to known defaults
+  if (gBrowser) {
+    const defaultPorts = { chrome: '9222', dia: '9223', brave: '9224', edge: '9225', chromium: '9226', arc: '9227' };
+    const key = gBrowser.toLowerCase();
+    if (defaultPorts[key]) return defaultPorts[key];
+  }
+
+  // Last resort: try getWsUrl (will probe)
+  const wsUrl = await getWsUrl();
+  return extractPort(wsUrl);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function listDaemonSockets() {
+function listMasterSockets() {
   return readdirSync('/tmp')
-    .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
+    .filter(f => f.startsWith('cdp-master-') && f.endsWith('.sock'))
     .map(f => ({
-      targetId: f.slice(4, -5),
+      port: f.slice(11, -5),
       socketPath: `/tmp/${f}`,
     }));
+}
+
+// Also clean up legacy per-tab sockets
+function listLegacySockets() {
+  return readdirSync('/tmp')
+    .filter(f => f.startsWith('cdp-') && !f.startsWith('cdp-master-') && f.endsWith('.sock'))
+    .map(f => `/tmp/${f}`);
 }
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
@@ -91,6 +446,7 @@ class CDP {
           else resolve(msg.result);
         } else if (msg.method && this.#eventHandlers.has(msg.method)) {
           for (const handler of [...this.#eventHandlers.get(msg.method)]) {
+            // Pass full msg so handlers can filter by sessionId
             handler(msg.params || {}, msg);
           }
         }
@@ -124,13 +480,16 @@ class CDP {
     };
   }
 
-  waitForEvent(method, timeout = TIMEOUT) {
+  // Wait for an event, optionally filtered by sessionId for multiplexed sessions.
+  waitForEvent(method, timeout = TIMEOUT, filterSessionId = null) {
     let settled = false;
     let off;
     let timer;
     const promise = new Promise((resolve, reject) => {
-      off = this.onEvent(method, (params) => {
+      off = this.onEvent(method, (params, msg) => {
         if (settled) return;
+        // If filtering by session, skip events from other sessions
+        if (filterSessionId && msg.sessionId !== filterSessionId) return;
         settled = true;
         clearTimeout(timer);
         off();
@@ -167,12 +526,18 @@ async function getPages(cdp) {
   return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
 }
 
-function formatPageList(pages) {
+function formatPageList(pages, contextMap = null) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
+  const showProfile = contextMap && Object.values(contextMap).some(v => v);
   return pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
-    const title = p.title.substring(0, 54).padEnd(54);
-    return `${id}  ${title}  ${p.url}`;
+    const profileName = contextMap?.[p.browserContextId];
+    const profileCol = showProfile
+      ? `[${(profileName || '?').substring(0, 12).padEnd(12)}]  `
+      : '';
+    const titleLen = showProfile ? 40 : 54;
+    const title = p.title.substring(0, titleLen).padEnd(titleLen);
+    return `${id}  ${profileCol}${title}  ${p.url}`;
   }).join('\n');
 }
 
@@ -325,7 +690,8 @@ async function waitForDocumentReady(cdp, sid, timeoutMs = NAVIGATION_TIMEOUT) {
 
 async function navStr(cdp, sid, url) {
   await cdp.send('Page.enable', {}, sid);
-  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
+  // Filter by sessionId so we don't catch load events from other tabs
+  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT, sid);
   const result = await cdp.send('Page.navigate', { url }, sid);
   if (result.errorText) {
     loadEvent.cancel();
@@ -428,28 +794,44 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tab daemon
+// Master daemon — one per browser port, multiplexes all tab sessions
 // ---------------------------------------------------------------------------
 
-async function runDaemon(targetId) {
-  const sp = sockPath(targetId);
+async function runMasterDaemon(port) {
+  const sp = masterSockPath(port);
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
-    process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
+    process.stderr.write(`Master daemon: cannot connect to browser: ${e.message}\n`);
     process.exit(1);
   }
 
-  let sessionId;
-  try {
-    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    sessionId = res.sessionId;
-  } catch (e) {
-    process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
-    cdp.close();
-    process.exit(1);
+  // Session management: targetId → sessionId (lazy attach)
+  const sessions = new Map();
+  const pendingAttach = new Map();
+
+  async function attachSession(targetId) {
+    if (sessions.has(targetId)) return sessions.get(targetId);
+    // Prevent double-attach from concurrent requests
+    if (pendingAttach.has(targetId)) return pendingAttach.get(targetId);
+    const p = (async () => {
+      const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+      sessions.set(targetId, sessionId);
+      pendingAttach.delete(targetId);
+      return sessionId;
+    })();
+    pendingAttach.set(targetId, p);
+    try { return await p; }
+    catch (e) { pendingAttach.delete(targetId); throw e; }
+  }
+
+  async function detachSession(targetId) {
+    const sessionId = sessions.get(targetId);
+    if (!sessionId) return;
+    sessions.delete(targetId);
+    try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
   }
 
   // Shutdown helpers
@@ -463,12 +845,15 @@ async function runDaemon(targetId) {
     process.exit(0);
   }
 
-  // Exit if target goes away or Chrome disconnects
+  // Clean up sessions when tabs close (but keep the master daemon running)
   cdp.onEvent('Target.targetDestroyed', (params) => {
-    if (params.targetId === targetId) shutdown();
+    sessions.delete(params.targetId);
   });
   cdp.onEvent('Target.detachedFromTarget', (params) => {
-    if (params.sessionId === sessionId) shutdown();
+    // Find and remove the session by sessionId
+    for (const [tid, sid] of sessions) {
+      if (sid === params.sessionId) { sessions.delete(tid); break; }
+    }
   });
   cdp.onClose(() => shutdown());
   process.on('SIGTERM', shutdown);
@@ -481,8 +866,8 @@ async function runDaemon(targetId) {
     idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   }
 
-  // Handle a command
-  async function handleCommand({ cmd, args }) {
+  // Handle a command — now includes targetId for tab-scoped commands
+  async function handleCommand({ cmd, targetId, args }) {
     resetIdle();
     try {
       let result;
@@ -497,19 +882,59 @@ async function runDaemon(targetId) {
           result = JSON.stringify(pages);
           break;
         }
-        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
-        case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0]); break;
-        case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
-        case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
-        case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-        case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
-        case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
-        case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
-        case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-        case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'detach': {
+          await detachSession(targetId);
+          result = 'Detached';
+          break;
+        }
+        case 'get_default_context': {
+          const { defaultBrowserContextId } = await cdp.send('Target.getBrowserContexts');
+          result = defaultBrowserContextId || '';
+          break;
+        }
+        case 'open': {
+          // Open a new tab, optionally in a specific browserContextId
+          const url = args[0] || 'about:blank';
+          const browserContextId = args[1] || undefined;
+          const params = { url };
+          if (browserContextId) params.browserContextId = browserContextId;
+          const { targetId: newId } = await cdp.send('Target.createTarget', params);
+          result = newId;
+          break;
+        }
+        case 'close': {
+          if (!targetId) return { ok: false, error: 'targetId required' };
+          await cdp.send('Target.closeTarget', { targetId });
+          sessions.delete(targetId);
+          result = 'Closed';
+          break;
+        }
         case 'stop': return { ok: true, result: '', stopAfter: true };
-        default: return { ok: false, error: `Unknown command: ${cmd}` };
+        default: {
+          // Tab commands — need a session
+          if (!targetId) return { ok: false, error: 'targetId required for this command' };
+          let sessionId;
+          try {
+            sessionId = await attachSession(targetId);
+          } catch (e) {
+            sessions.delete(targetId);
+            return { ok: false, error: `Failed to attach to tab: ${e.message}` };
+          }
+          switch (cmd) {
+            case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
+            case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
+            case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0]); break;
+            case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
+            case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
+            case 'net': case 'network': result = await netStr(cdp, sessionId); break;
+            case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
+            case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
+            case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
+            case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
+            case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+            default: return { ok: false, error: `Unknown command: ${cmd}` };
+          }
+        }
       }
       return { ok: true, result: result ?? '' };
     } catch (e) {
@@ -517,11 +942,9 @@ async function runDaemon(targetId) {
     }
   }
 
-  // Unix socket server — NDJSON protocol
-  // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
-  // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
+  // Unix socket server — NDJSON protocol, supports multiple concurrent connections
+  // Request:  { "id": <number>, "cmd": "<command>", "targetId": "<optional>", "args": [...] }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
-  //           or { "id": <number>, "ok": false, "error": "<message>" }
   const server = net.createServer((conn) => {
     let buf = '';
     conn.on('data', (chunk) => {
@@ -548,10 +971,11 @@ async function runDaemon(targetId) {
 
   try { unlinkSync(sp); } catch {}
   server.listen(sp);
+  process.stderr.write(`Master daemon running on port ${port} (socket: ${sp})\n`);
 }
 
 // ---------------------------------------------------------------------------
-// CLI ↔ daemon communication
+// CLI ↔ master daemon communication
 // ---------------------------------------------------------------------------
 
 function connectToSocket(sp) {
@@ -562,27 +986,31 @@ function connectToSocket(sp) {
   });
 }
 
-async function getOrStartTabDaemon(targetId) {
-  const sp = sockPath(targetId);
-  // Try existing daemon
+async function getOrStartMasterDaemon(port) {
+  const sp = masterSockPath(port);
+  // Try existing master daemon
   try { return await connectToSocket(sp); } catch {}
 
   // Clean stale socket
   try { unlinkSync(sp); } catch {}
 
-  // Spawn daemon
-  const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
+  // Spawn master daemon — forward browser/port flags
+  const daemonArgs = [process.argv[1]];
+  if (gBrowser) daemonArgs.push('--browser', gBrowser);
+  if (gPort) daemonArgs.push('--port', gPort);
+  daemonArgs.push('_master', port);
+  const child = spawn(process.execPath, daemonArgs, {
     detached: true,
     stdio: 'ignore',
   });
   child.unref();
 
-  // Wait for socket (includes time for user to click Allow)
+  // Wait for socket (includes time for user to click Allow on Chrome)
   for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
     await sleep(DAEMON_CONNECT_DELAY);
     try { return await connectToSocket(sp); } catch {}
   }
-  throw new Error('Daemon failed to start — did you click Allow in Chrome?');
+  throw new Error('Master daemon failed to start — did you click Allow in Chrome?');
 }
 
 function sendCommand(conn, req) {
@@ -637,36 +1065,41 @@ function sendCommand(conn, req) {
   });
 }
 
-// Find any running daemon socket to reuse for list
-function findAnyDaemonSocket() {
-  return listDaemonSockets()[0]?.socketPath || null;
-}
-
 // ---------------------------------------------------------------------------
 // Stop daemons
 // ---------------------------------------------------------------------------
 
 async function stopDaemons(targetPrefix) {
-  const daemons = listDaemonSockets();
+  const masters = listMasterSockets();
 
   if (targetPrefix) {
-    const targetId = resolvePrefix(targetPrefix, daemons.map(d => d.targetId), 'daemon');
-    const daemon = daemons.find(d => d.targetId === targetId);
-    try {
-      const conn = await connectToSocket(daemon.socketPath);
-      await sendCommand(conn, { cmd: 'stop' });
-    } catch {
-      try { unlinkSync(daemon.socketPath); } catch {}
+    // Stop/detach a specific tab session on all master daemons
+    for (const master of masters) {
+      try {
+        const conn = await connectToSocket(master.socketPath);
+        await sendCommand(conn, { cmd: 'detach', targetId: targetPrefix });
+      } catch {}
     }
     return;
   }
 
-  for (const daemon of daemons) {
+  // Stop all master daemons
+  for (const master of masters) {
     try {
-      const conn = await connectToSocket(daemon.socketPath);
+      const conn = await connectToSocket(master.socketPath);
       await sendCommand(conn, { cmd: 'stop' });
     } catch {
-      try { unlinkSync(daemon.socketPath); } catch {}
+      try { unlinkSync(master.socketPath); } catch {}
+    }
+  }
+
+  // Clean up any legacy per-tab sockets
+  for (const sp of listLegacySockets()) {
+    try {
+      const conn = await connectToSocket(sp);
+      await sendCommand(conn, { cmd: 'stop' });
+    } catch {
+      try { unlinkSync(sp); } catch {}
     }
   }
 }
@@ -677,9 +1110,23 @@ async function stopDaemons(targetPrefix) {
 
 const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 
-Usage: cdp <command> [args]
+Usage: cdp [--browser <name>] [--port <number>] <command> [args]
 
-  list                              List open pages (shows unique target prefixes)
+Global flags:
+  --browser <name>   Target a specific browser: chrome, brave, edge, chromium, arc, dia
+                     (env: CDP_BROWSER)
+  --port <number>    Connect to a specific debug port instead of auto-discovering
+                     (env: CDP_PORT)
+
+Commands:
+
+  use <browser|port>                Set active browser for subsequent commands
+                                    e.g. "use dia", "use chrome", "use 9223"
+                                    Use "use auto" to clear and auto-discover
+  profiles                          List all browser profiles
+  list [--profile <name>]           List open pages (shows unique target prefixes)
+                                    With --profile, filter to a specific profile
+  open <url> [--profile <name>]     Open URL in a new tab (default profile unless specified)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
@@ -694,7 +1141,7 @@ Usage: cdp <command> [args]
                                     Optional interval in ms between clicks (default 1500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
-  stop  [target]                    Stop daemon(s)
+  stop  [target]                    Stop master daemon (or detach a specific tab)
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
@@ -716,15 +1163,18 @@ EVAL SAFETY NOTE
   "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
   collect all data in a single eval.
 
-DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
+MASTER DAEMON
+  A single master daemon per browser port holds the WebSocket connection
+  and multiplexes CDP sessions across tabs. This means Chrome's "Allow
+  remote debugging?" popup only fires ONCE per session, not per tab.
+  Socket path: /tmp/cdp-master-<port>.sock
+  Multiple agents can connect simultaneously — the daemon handles
+  concurrent requests across different tabs.
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-    Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
+    Request:  {"id":<number>, "cmd":"<command>", "targetId":"<optional>", "args":[...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The daemon auto-exits after 20 min of inactivity.
 `;
 
 const NEEDS_TARGET = new Set([
@@ -733,42 +1183,191 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  // Extract global flags before command parsing
+  const rawArgs = process.argv.slice(2);
+  const filteredArgs = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    if (rawArgs[i] === '--browser' && i + 1 < rawArgs.length) {
+      gBrowser = rawArgs[++i];
+    } else if (rawArgs[i] === '--port' && i + 1 < rawArgs.length) {
+      gPort = rawArgs[++i];
+    } else {
+      filteredArgs.push(rawArgs[i]);
+    }
+  }
+  const [cmd, ...args] = filteredArgs;
 
-  // Daemon mode (internal)
-  if (cmd === '_daemon') { await runDaemon(args[0]); return; }
+  // Master daemon mode (internal)
+  if (cmd === '_master') { await runMasterDaemon(args[0]); return; }
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);
   }
 
-  // List — use existing daemon if available, otherwise direct
+  // Use command — set active browser session
+  if (cmd === 'use') {
+    const val = args[0];
+    if (!val || val === 'auto' || val === 'clear') {
+      clearSession();
+      console.log('Session cleared — will auto-discover browser.');
+      return;
+    }
+    if (/^\d+$/.test(val)) {
+      saveSession(null, val);
+      console.log(`Session set to port ${val}. All commands will target this port.`);
+    } else {
+      const key = val.toLowerCase();
+      if (!BROWSER_PROFILES[key]) {
+        console.error(`Unknown browser "${val}". Known: ${Object.keys(BROWSER_PROFILES).join(', ')}`);
+        process.exit(1);
+      }
+      saveSession(key, null);
+      console.log(`Session set to ${key}. All commands will target this browser.`);
+    }
+    return;
+  }
+
+  // Load saved session (only if no CLI flags or env vars set)
+  loadSession();
+
+  // Extract --profile flag from args
+  let gProfile = null;
+  const cleanArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profile' && i + 1 < args.length) {
+      gProfile = args[++i];
+    } else {
+      cleanArgs.push(args[i]);
+    }
+  }
+
+  // Resolve canonical port for master daemon
+  const port = await resolvePort();
+
+  // Profiles — list all browser profiles
+  if (cmd === 'profiles') {
+    const profiles = readProfiles();
+    if (profiles.length === 0) {
+      console.log('No profiles found.');
+    } else {
+      // Also show context mapping if available
+      const defaultCtxId = await getDefaultContextId(port).catch(() => null);
+      if (defaultCtxId) updateContextMap([], defaultCtxId);
+      const map = loadContextMap();
+      const reverseMap = {};
+      for (const [ctx, name] of Object.entries(map)) {
+        if (name) reverseMap[name] = ctx;
+      }
+      for (const p of profiles) {
+        const ctx = reverseMap[p.name];
+        const status = ctx ? '●' : '○';
+        const gaiaStr = p.gaia ? ` (${p.gaia})` : '';
+        console.log(`  ${status} ${p.name}${gaiaStr}  [${p.dir}]`);
+      }
+      console.log(`\n  ● = has loaded tabs    ○ = no loaded tabs`);
+    }
+    return;
+  }
+
+  // List — route through master daemon, with optional profile filter
   if (cmd === 'list' || cmd === 'ls') {
-    let pages;
-    const existingSock = findAnyDaemonSocket();
-    if (existingSock) {
-      try {
-        const conn = await connectToSocket(existingSock);
-        const resp = await sendCommand(conn, { cmd: 'list_raw' });
-        if (resp.ok) pages = JSON.parse(resp.result);
-      } catch {}
+    const conn = await getOrStartMasterDaemon(port);
+    const resp = await sendCommand(conn, { cmd: 'list_raw' });
+    if (!resp.ok) { console.error('Error:', resp.error); process.exit(1); }
+    let pages = JSON.parse(resp.result);
+
+    // Get default context and update profile mapping
+    const defaultCtxId = await getDefaultContextId(port).catch(() => null);
+    const contextMap = updateContextMap(pages, defaultCtxId);
+
+    // Filter by profile if specified
+    if (gProfile) {
+      const profile = resolveProfileDir(gProfile);
+      const matchingContexts = new Set();
+      for (const [ctx, name] of Object.entries(contextMap)) {
+        if (name === profile.name) matchingContexts.add(ctx);
+      }
+      // If no contexts mapped yet for this profile, try to discover
+      if (matchingContexts.size === 0) {
+        try {
+          const ctx = await discoverProfileContext(profile.dir, port);
+          matchingContexts.add(ctx);
+          // Re-fetch pages after probe
+          const resp2 = await sendCommand(await getOrStartMasterDaemon(port), { cmd: 'list_raw' });
+          if (resp2.ok) pages = JSON.parse(resp2.result);
+        } catch (e) {
+          console.error(`Warning: ${e.message}`);
+        }
+      }
+      if (matchingContexts.size > 0) {
+        pages = pages.filter(p => matchingContexts.has(p.browserContextId));
+      }
     }
-    if (!pages) {
-      // No daemon running — connect directly (will trigger one Allow)
-      const cdp = new CDP();
-      await cdp.connect(getWsUrl());
-      pages = await getPages(cdp);
-      cdp.close();
-    }
+
     writeFileSync(PAGES_CACHE, JSON.stringify(pages));
-    console.log(formatPageList(pages));
+    console.log(formatPageList(pages, contextMap));
+    setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
+  // Open — create a new tab, optionally in a specific profile
+  if (cmd === 'open') {
+    const url = cleanArgs[0] || 'about:blank';
+    if (gProfile) {
+      // Open in a specific profile using the OS (-na forces new instance for profile routing)
+      const profile = resolveProfileDir(gProfile);
+      const browserApp = {
+        chrome: 'Google Chrome', brave: 'Brave Browser', edge: 'Microsoft Edge',
+        chromium: 'Chromium', dia: 'Dia', arc: 'Arc',
+      }[(gBrowser || 'chrome').toLowerCase()] || 'Google Chrome';
+
+      // Snapshot contexts before opening
+      const connBefore = await getOrStartMasterDaemon(port);
+      const respBefore = await sendCommand(connBefore, { cmd: 'list_raw' });
+      const contextsBefore = new Set();
+      if (respBefore.ok) {
+        JSON.parse(respBefore.result).forEach(p => contextsBefore.add(p.browserContextId));
+      }
+
+      spawn('open', ['-na', browserApp, '--args', `--profile-directory=${profile.dir}`, url], {
+        detached: true, stdio: 'ignore',
+      }).unref();
+
+      // Wait for the new tab and discover its context
+      for (let i = 0; i < 15; i++) {
+        await sleep(500);
+        const conn2 = await getOrStartMasterDaemon(port);
+        const resp2 = await sendCommand(conn2, { cmd: 'list_raw' });
+        if (!resp2.ok) continue;
+        const pages = JSON.parse(resp2.result);
+        const newPage = pages.find(p => !contextsBefore.has(p.browserContextId) || p.url === url || p.url === url + '/');
+        if (newPage) {
+          // Map the new context to this profile
+          const map = loadContextMap();
+          if (!map[newPage.browserContextId] || map[newPage.browserContextId] === null) {
+            map[newPage.browserContextId] = profile.name;
+            saveContextMap(map);
+          }
+          console.log(`Opened ${url} in profile "${profile.name}" (target: ${newPage.targetId.slice(0,8)})`);
+          setTimeout(() => process.exit(0), 100);
+          return;
+        }
+      }
+      console.log(`Opening ${url} in profile "${profile.name}" (tab may still be loading)`);
+    } else {
+      // Open in default context via CDP
+      const conn = await getOrStartMasterDaemon(port);
+      const resp = await sendCommand(conn, { cmd: 'open', args: [url] });
+      if (!resp.ok) { console.error('Error:', resp.error); process.exit(1); }
+      console.log(`Opened ${url} (target: ${resp.result})`);
+    }
     setTimeout(() => process.exit(0), 100);
     return;
   }
 
   // Stop
   if (cmd === 'stop') {
-    await stopDaemons(args[0]);
+    await stopDaemons(cleanArgs[0]);
     return;
   }
 
@@ -779,31 +1378,25 @@ async function main() {
     process.exit(1);
   }
 
-  const targetPrefix = args[0];
+  const targetPrefix = cleanArgs[0];
   if (!targetPrefix) {
     console.error('Error: target ID required. Run "cdp list" first.');
     process.exit(1);
   }
 
-  // Resolve prefix → full targetId from cache or running daemon
+  // Resolve prefix → full targetId from cache
   let targetId;
-  const daemonTargetIds = listDaemonSockets().map(d => d.targetId);
-  const daemonMatches = daemonTargetIds.filter(id => id.toUpperCase().startsWith(targetPrefix.toUpperCase()));
-
-  if (daemonMatches.length > 0) {
-    targetId = resolvePrefix(targetPrefix, daemonTargetIds, 'daemon');
-  } else {
-    if (!existsSync(PAGES_CACHE)) {
-      console.error('No page list cached. Run "cdp list" first.');
-      process.exit(1);
-    }
-    const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-    targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  if (!existsSync(PAGES_CACHE)) {
+    console.error('No page list cached. Run "cdp list" first.');
+    process.exit(1);
   }
+  const cachedPages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+  targetId = resolvePrefix(targetPrefix, cachedPages.map(p => p.targetId), 'target', 'Run "cdp list".');
 
-  const conn = await getOrStartTabDaemon(targetId);
+  // Connect to master daemon
+  const conn = await getOrStartMasterDaemon(port);
 
-  const cmdArgs = args.slice(1);
+  const cmdArgs = cleanArgs.slice(1);
 
   if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
@@ -825,7 +1418,7 @@ async function main() {
     process.exit(1);
   }
 
-  const response = await sendCommand(conn, { cmd, args: cmdArgs });
+  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs });
 
   if (response.ok) {
     if (response.result) console.log(response.result);
