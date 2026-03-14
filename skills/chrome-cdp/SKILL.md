@@ -5,7 +5,7 @@ description: Interact with local Chromium browser sessions (Chrome, Dia, Brave, 
 
 # Chrome CDP
 
-Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection. Supports multiple Chromium-based browsers simultaneously.
+Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection. Supports multiple Chromium-based browsers and profiles simultaneously.
 
 ## Prerequisites
 
@@ -55,6 +55,30 @@ CDP_PORT=9223 scripts/cdp.mjs list
 
 **Multiple agents:** Use `--port` flags directly instead of `use` — the session file is shared.
 
+## Profiles
+
+Browsers can have multiple profiles (e.g., Work, Personal, Glints). All profiles share the same debug port.
+
+```bash
+# List all profiles
+scripts/cdp.mjs --port 9222 profiles
+
+# List shows profile name for each tab
+scripts/cdp.mjs --port 9222 list
+# D8D3BE54  [Work        ]  Example Page  https://example.com
+
+# Filter tabs by profile
+scripts/cdp.mjs --port 9222 list --profile Work
+
+# Open URL in default profile
+scripts/cdp.mjs --port 9222 open "https://example.com"
+
+# Open URL in specific profile
+scripts/cdp.mjs --port 9222 open "https://example.com" --profile "Casual Me"
+```
+
+**Note:** Opening in a specific profile only works if that profile window is already open. CDP cannot switch profiles — the user must open the profile window first via Chrome's profile picker.
+
 ## Commands
 
 All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId prefix from `list`; copy the full prefix shown in the `list` output (for example `6BE827FA`). The CLI rejects ambiguous prefixes.
@@ -62,14 +86,22 @@ All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId pref
 ### List open pages
 
 ```bash
-scripts/cdp.mjs list
+scripts/cdp.mjs list                        # all tabs, all profiles
+scripts/cdp.mjs list --profile Work         # filter by profile
 scripts/cdp.mjs --port 9223 list            # specific browser
+```
+
+### Profiles
+
+```bash
+scripts/cdp.mjs profiles                    # list all browser profiles
 ```
 
 ### Open a new tab
 
 ```bash
-scripts/cdp.mjs open <url>
+scripts/cdp.mjs open <url>                  # default profile
+scripts/cdp.mjs open <url> --profile Work   # specific profile (window must be open)
 ```
 
 ### Take a screenshot

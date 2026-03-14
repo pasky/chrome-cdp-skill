@@ -24,6 +24,7 @@ const PAGES_CACHE = '/tmp/cdp-pages.json';
 const SESSION_FILE = '/tmp/cdp-session.json';
 
 function masterSockPath(port) { return `/tmp/cdp-master-${port}.sock`; }
+const CONTEXT_MAP_FILE = '/tmp/cdp-context-profiles.json';
 
 // Browser profile paths keyed by short name.
 const BROWSER_PROFILES = {
@@ -95,6 +96,176 @@ function saveSession(browser, port) {
 
 function clearSession() {
   try { unlinkSync(SESSION_FILE); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Profile support — reads Chrome's Local State to map profiles
+// ---------------------------------------------------------------------------
+
+// Get the browser data directory for the current browser.
+function getBrowserDataDir() {
+  const key = (gBrowser || 'chrome').toLowerCase();
+  const profile = BROWSER_PROFILES[key];
+  if (!profile) return null;
+  const dir = profile[platform];
+  return dir ? resolve(homedir(), dir) : null;
+}
+
+// Read all profile names from the browser's Local State file.
+// Returns [{dir: "Default", name: "Work"}, {dir: "Profile 2", name: "Casual Me"}, ...]
+function readProfiles() {
+  const dataDir = getBrowserDataDir();
+  if (!dataDir) return [];
+  const localStatePath = resolve(dataDir, 'Local State');
+  try {
+    const state = JSON.parse(readFileSync(localStatePath, 'utf8'));
+    const cache = state?.profile?.info_cache || {};
+    return Object.entries(cache).map(([dir, info]) => ({
+      dir,
+      name: info.name || dir,
+      gaia: info.gaia_name || '',
+    }));
+  } catch { return []; }
+}
+
+// Build/update the browserContextId → profile name mapping.
+// We discover mappings by seeing which contexts exist for pages.
+// Saved to a temp file so it persists across CLI invocations.
+function loadContextMap() {
+  try { return JSON.parse(readFileSync(CONTEXT_MAP_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function saveContextMap(map) {
+  writeFileSync(CONTEXT_MAP_FILE, JSON.stringify(map));
+}
+
+// Given pages with browserContextId and the known profiles, try to map contexts to profiles.
+// Only the defaultBrowserContextId gets auto-mapped (via Local State's last_used).
+// Other contexts are discovered via the probe mechanism or stay as "?" until identified.
+function updateContextMap(pages, defaultContextId) {
+  const map = loadContextMap();
+  const profiles = readProfiles();
+
+  // Auto-map unmapped contexts to profiles using last_active_profiles order.
+  // Chrome's chrome://inspect toggle doesn't use "default context" meaningfully,
+  // so we map by matching unmapped contexts to unmapped active profiles in order.
+  const dataDir = getBrowserDataDir();
+  if (dataDir && profiles.length > 0) {
+    try {
+      const state = JSON.parse(readFileSync(resolve(dataDir, 'Local State'), 'utf8'));
+      const lastActive = state?.profile?.last_active_profiles || [];
+      const alreadyMappedNames = new Set(Object.values(map).filter(Boolean));
+
+      // Count pages per context to prioritize (contexts with pages are real profiles)
+      const contextPageCount = {};
+      for (const p of pages) {
+        contextPageCount[p.browserContextId] = (contextPageCount[p.browserContextId] || 0) + 1;
+      }
+
+      // Get unmapped contexts that have pages, sorted by page count desc
+      const unmappedContexts = Object.entries(contextPageCount)
+        .filter(([ctx]) => !map[ctx] || map[ctx] === null)
+        .sort((a, b) => b[1] - a[1])
+        .map(([ctx]) => ctx);
+
+      // Get unmapped active profiles in order
+      const unmappedProfiles = lastActive
+        .map(dir => profiles.find(p => p.dir === dir))
+        .filter(p => p && !alreadyMappedNames.has(p.name));
+
+      // Assign in order: most-tabs context → first unmapped active profile
+      for (let i = 0; i < Math.min(unmappedContexts.length, unmappedProfiles.length); i++) {
+        map[unmappedContexts[i]] = unmappedProfiles[i].name;
+      }
+    } catch {}
+  }
+
+  // Register unknown contexts but don't guess their profile — leave as null
+  const knownContexts = new Set(Object.keys(map));
+  const contextIds = new Set(pages.map(p => p.browserContextId));
+  for (const ctx of contextIds) {
+    if (!knownContexts.has(ctx)) {
+      map[ctx] = null; // unknown — discover via `list --profile` or probe
+    }
+  }
+
+  saveContextMap(map);
+  return map;
+}
+
+// Resolve a profile name or dir to a profile directory.
+function resolveProfileDir(nameOrDir) {
+  const profiles = readProfiles();
+  const lower = nameOrDir.toLowerCase();
+  // Exact match on dir
+  const byDir = profiles.find(p => p.dir.toLowerCase() === lower);
+  if (byDir) return byDir;
+  // Match on name (case-insensitive)
+  const byName = profiles.filter(p => p.name.toLowerCase() === lower);
+  if (byName.length === 1) return byName[0];
+  // Prefix match on name
+  const byPrefix = profiles.filter(p => p.name.toLowerCase().startsWith(lower));
+  if (byPrefix.length === 1) return byPrefix[0];
+  if (byPrefix.length > 1) throw new Error(`Ambiguous profile "${nameOrDir}" — matches: ${byPrefix.map(p => p.name).join(', ')}`);
+  throw new Error(`Unknown profile "${nameOrDir}". Available: ${profiles.map(p => p.name).join(', ')}`);
+}
+
+// Discover which browserContextId belongs to which profile by opening a temp page
+// in a specific profile and seeing what context it gets.
+async function discoverProfileContext(profileDir, port) {
+  const dataDir = getBrowserDataDir();
+  if (!dataDir) throw new Error('Cannot determine browser data directory');
+
+  // Open a temporary page in the target profile
+  const marker = `cdp-profile-probe-${Date.now()}`;
+  const markerUrl = `data:text/html,<title>${marker}</title>`;
+
+  // Use the OS to open Chrome with the specific profile
+  const browserApp = {
+    chrome: 'Google Chrome', brave: 'Brave Browser', edge: 'Microsoft Edge',
+    chromium: 'Chromium', dia: 'Dia', arc: 'Arc',
+  }[(gBrowser || 'chrome').toLowerCase()] || 'Google Chrome';
+
+  spawn('open', ['-na', browserApp, '--args', `--profile-directory=${profileDir}`, markerUrl], {
+    detached: true, stdio: 'ignore',
+  }).unref();
+
+  // Wait for the probe tab to appear, then read its browserContextId
+  const conn = await getOrStartMasterDaemon(port);
+  for (let i = 0; i < 20; i++) {
+    await sleep(500);
+    const resp = await sendCommand(await getOrStartMasterDaemon(port), { cmd: 'list_raw' });
+    if (!resp.ok) continue;
+    const pages = JSON.parse(resp.result);
+    const probe = pages.find(p => p.title === marker || p.url.includes(marker));
+    if (probe) {
+      // Found it — record the mapping
+      const map = loadContextMap();
+      const profiles = readProfiles();
+      const profile = profiles.find(p => p.dir === profileDir);
+      map[probe.browserContextId] = profile?.name || profileDir;
+      saveContextMap(map);
+
+      // Close the probe tab
+      try {
+        await sendCommand(await getOrStartMasterDaemon(port), {
+          cmd: 'evalraw', targetId: probe.targetId,
+          args: ['Target.closeTarget', JSON.stringify({ targetId: probe.targetId })]
+        });
+      } catch {}
+
+      return probe.browserContextId;
+    }
+  }
+  throw new Error(`Could not discover context for profile "${profileDir}" — probe tab didn't appear`);
+}
+
+// Discover the default browserContextId from the master daemon.
+async function getDefaultContextId(port) {
+  const conn = await getOrStartMasterDaemon(port);
+  const resp = await sendCommand(conn, { cmd: 'get_default_context' });
+  return resp.ok ? resp.result : null;
 }
 
 // Discover the WebSocket URL by querying the HTTP endpoint on a given port.
@@ -355,12 +526,18 @@ async function getPages(cdp) {
   return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
 }
 
-function formatPageList(pages) {
+function formatPageList(pages, contextMap = null) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
+  const showProfile = contextMap && Object.values(contextMap).some(v => v);
   return pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
-    const title = p.title.substring(0, 54).padEnd(54);
-    return `${id}  ${title}  ${p.url}`;
+    const profileName = contextMap?.[p.browserContextId];
+    const profileCol = showProfile
+      ? `[${(profileName || '?').substring(0, 12).padEnd(12)}]  `
+      : '';
+    const titleLen = showProfile ? 40 : 54;
+    const title = p.title.substring(0, titleLen).padEnd(titleLen);
+    return `${id}  ${profileCol}${title}  ${p.url}`;
   }).join('\n');
 }
 
@@ -710,10 +887,18 @@ async function runMasterDaemon(port) {
           result = 'Detached';
           break;
         }
+        case 'get_default_context': {
+          const { defaultBrowserContextId } = await cdp.send('Target.getBrowserContexts');
+          result = defaultBrowserContextId || '';
+          break;
+        }
         case 'open': {
-          // Open a new tab
+          // Open a new tab, optionally in a specific browserContextId
           const url = args[0] || 'about:blank';
-          const { targetId: newId } = await cdp.send('Target.createTarget', { url });
+          const browserContextId = args[1] || undefined;
+          const params = { url };
+          if (browserContextId) params.browserContextId = browserContextId;
+          const { targetId: newId } = await cdp.send('Target.createTarget', params);
           result = newId;
           break;
         }
@@ -938,8 +1123,10 @@ Commands:
   use <browser|port>                Set active browser for subsequent commands
                                     e.g. "use dia", "use chrome", "use 9223"
                                     Use "use auto" to clear and auto-discover
-  list                              List open pages (shows unique target prefixes)
-  open <url>                        Open URL in a new tab
+  profiles                          List all browser profiles
+  list [--profile <name>]           List open pages (shows unique target prefixes)
+                                    With --profile, filter to a specific profile
+  open <url> [--profile <name>]     Open URL in a new tab (default profile unless specified)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
@@ -1043,35 +1230,144 @@ async function main() {
   // Load saved session (only if no CLI flags or env vars set)
   loadSession();
 
+  // Extract --profile flag from args
+  let gProfile = null;
+  const cleanArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--profile' && i + 1 < args.length) {
+      gProfile = args[++i];
+    } else {
+      cleanArgs.push(args[i]);
+    }
+  }
+
   // Resolve canonical port for master daemon
   const port = await resolvePort();
 
-  // List — route through master daemon
+  // Profiles — list all browser profiles
+  if (cmd === 'profiles') {
+    const profiles = readProfiles();
+    if (profiles.length === 0) {
+      console.log('No profiles found.');
+    } else {
+      // Also show context mapping if available
+      const defaultCtxId = await getDefaultContextId(port).catch(() => null);
+      if (defaultCtxId) updateContextMap([], defaultCtxId);
+      const map = loadContextMap();
+      const reverseMap = {};
+      for (const [ctx, name] of Object.entries(map)) {
+        if (name) reverseMap[name] = ctx;
+      }
+      for (const p of profiles) {
+        const ctx = reverseMap[p.name];
+        const status = ctx ? '●' : '○';
+        const gaiaStr = p.gaia ? ` (${p.gaia})` : '';
+        console.log(`  ${status} ${p.name}${gaiaStr}  [${p.dir}]`);
+      }
+      console.log(`\n  ● = has loaded tabs    ○ = no loaded tabs`);
+    }
+    return;
+  }
+
+  // List — route through master daemon, with optional profile filter
   if (cmd === 'list' || cmd === 'ls') {
     const conn = await getOrStartMasterDaemon(port);
     const resp = await sendCommand(conn, { cmd: 'list_raw' });
     if (!resp.ok) { console.error('Error:', resp.error); process.exit(1); }
-    const pages = JSON.parse(resp.result);
+    let pages = JSON.parse(resp.result);
+
+    // Get default context and update profile mapping
+    const defaultCtxId = await getDefaultContextId(port).catch(() => null);
+    const contextMap = updateContextMap(pages, defaultCtxId);
+
+    // Filter by profile if specified
+    if (gProfile) {
+      const profile = resolveProfileDir(gProfile);
+      const matchingContexts = new Set();
+      for (const [ctx, name] of Object.entries(contextMap)) {
+        if (name === profile.name) matchingContexts.add(ctx);
+      }
+      // If no contexts mapped yet for this profile, try to discover
+      if (matchingContexts.size === 0) {
+        try {
+          const ctx = await discoverProfileContext(profile.dir, port);
+          matchingContexts.add(ctx);
+          // Re-fetch pages after probe
+          const resp2 = await sendCommand(await getOrStartMasterDaemon(port), { cmd: 'list_raw' });
+          if (resp2.ok) pages = JSON.parse(resp2.result);
+        } catch (e) {
+          console.error(`Warning: ${e.message}`);
+        }
+      }
+      if (matchingContexts.size > 0) {
+        pages = pages.filter(p => matchingContexts.has(p.browserContextId));
+      }
+    }
+
     writeFileSync(PAGES_CACHE, JSON.stringify(pages));
-    console.log(formatPageList(pages));
+    console.log(formatPageList(pages, contextMap));
     setTimeout(() => process.exit(0), 100);
     return;
   }
 
-  // Open — create a new tab
+  // Open — create a new tab, optionally in a specific profile
   if (cmd === 'open') {
-    const url = args[0] || 'about:blank';
-    const conn = await getOrStartMasterDaemon(port);
-    const resp = await sendCommand(conn, { cmd: 'open', args: [url] });
-    if (!resp.ok) { console.error('Error:', resp.error); process.exit(1); }
-    console.log(`Opened ${url} (target: ${resp.result})`);
+    const url = cleanArgs[0] || 'about:blank';
+    if (gProfile) {
+      // Open in a specific profile using the OS (-na forces new instance for profile routing)
+      const profile = resolveProfileDir(gProfile);
+      const browserApp = {
+        chrome: 'Google Chrome', brave: 'Brave Browser', edge: 'Microsoft Edge',
+        chromium: 'Chromium', dia: 'Dia', arc: 'Arc',
+      }[(gBrowser || 'chrome').toLowerCase()] || 'Google Chrome';
+
+      // Snapshot contexts before opening
+      const connBefore = await getOrStartMasterDaemon(port);
+      const respBefore = await sendCommand(connBefore, { cmd: 'list_raw' });
+      const contextsBefore = new Set();
+      if (respBefore.ok) {
+        JSON.parse(respBefore.result).forEach(p => contextsBefore.add(p.browserContextId));
+      }
+
+      spawn('open', ['-na', browserApp, '--args', `--profile-directory=${profile.dir}`, url], {
+        detached: true, stdio: 'ignore',
+      }).unref();
+
+      // Wait for the new tab and discover its context
+      for (let i = 0; i < 15; i++) {
+        await sleep(500);
+        const conn2 = await getOrStartMasterDaemon(port);
+        const resp2 = await sendCommand(conn2, { cmd: 'list_raw' });
+        if (!resp2.ok) continue;
+        const pages = JSON.parse(resp2.result);
+        const newPage = pages.find(p => !contextsBefore.has(p.browserContextId) || p.url === url || p.url === url + '/');
+        if (newPage) {
+          // Map the new context to this profile
+          const map = loadContextMap();
+          if (!map[newPage.browserContextId] || map[newPage.browserContextId] === null) {
+            map[newPage.browserContextId] = profile.name;
+            saveContextMap(map);
+          }
+          console.log(`Opened ${url} in profile "${profile.name}" (target: ${newPage.targetId.slice(0,8)})`);
+          setTimeout(() => process.exit(0), 100);
+          return;
+        }
+      }
+      console.log(`Opening ${url} in profile "${profile.name}" (tab may still be loading)`);
+    } else {
+      // Open in default context via CDP
+      const conn = await getOrStartMasterDaemon(port);
+      const resp = await sendCommand(conn, { cmd: 'open', args: [url] });
+      if (!resp.ok) { console.error('Error:', resp.error); process.exit(1); }
+      console.log(`Opened ${url} (target: ${resp.result})`);
+    }
     setTimeout(() => process.exit(0), 100);
     return;
   }
 
   // Stop
   if (cmd === 'stop') {
-    await stopDaemons(args[0]);
+    await stopDaemons(cleanArgs[0]);
     return;
   }
 
@@ -1082,7 +1378,7 @@ async function main() {
     process.exit(1);
   }
 
-  const targetPrefix = args[0];
+  const targetPrefix = cleanArgs[0];
   if (!targetPrefix) {
     console.error('Error: target ID required. Run "cdp list" first.');
     process.exit(1);
@@ -1100,7 +1396,7 @@ async function main() {
   // Connect to master daemon
   const conn = await getOrStartMasterDaemon(port);
 
-  const cmdArgs = args.slice(1);
+  const cmdArgs = cleanArgs.slice(1);
 
   if (cmd === 'eval') {
     const expr = cmdArgs.join(' ');
