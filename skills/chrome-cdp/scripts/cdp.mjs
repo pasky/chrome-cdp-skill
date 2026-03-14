@@ -25,14 +25,15 @@ const PAGES_CACHE = '/tmp/cdp-pages.json';
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
 function getWsUrl() {
-  const candidates = [
-    resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-    resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
-  ];
-  const portFile = candidates.find(path => existsSync(path));
-  if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  const home = homedir();
+  const f = [
+    process.env.CDP_PORT_FILE,
+    ...['vivaldi-snapshot', 'vivaldi', 'google-chrome', 'chromium'].map(b => `${home}/.config/${b}/DevToolsActivePort`),
+    `${home}/Library/Application Support/Google/Chrome/DevToolsActivePort`,
+  ].filter(Boolean).find(existsSync);
+  if (!f) throw new Error('No DevToolsActivePort. Enable remote debugging at chrome://inspect/#remote-debugging');
+  const [port, path] = readFileSync(f, 'utf8').trim().split('\n');
+  return `ws://127.0.0.1:${port}${path}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
