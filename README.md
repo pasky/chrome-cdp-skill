@@ -28,6 +28,10 @@ Clone or copy the `skills/chrome-cdp/` directory wherever your agent loads skill
 
 Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's it.
 
+## Compatibility notes
+
+- The CLI now probes additional `DevToolsActivePort` locations for Chrome-family browsers, including Chrome Beta, Chrome for Testing, Chromium, Brave, and Edge.
+
 ## Usage
 
 ```bash
