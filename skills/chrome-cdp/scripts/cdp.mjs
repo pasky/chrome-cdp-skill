@@ -24,15 +24,69 @@ const PAGES_CACHE = '/tmp/cdp-pages.json';
 
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
-function getWsUrl() {
+function getPortFileCandidates() {
+  const home = homedir();
   const candidates = [
-    resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
-    resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
-  ];
-  const portFile = candidates.find(path => existsSync(path));
-  if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
+    process.env.CHROME_CDP_PORT_FILE,
+    resolve(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome/Default/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome Beta/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome Beta/Default/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome for Testing/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome for Testing/Default/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Chromium/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Chromium/Default/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/BraveSoftware/Brave-Browser/Default/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Microsoft Edge/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Microsoft Edge/Default/DevToolsActivePort'),
+    resolve(home, '.config/google-chrome/DevToolsActivePort'),
+    resolve(home, '.config/google-chrome/Default/DevToolsActivePort'),
+    resolve(home, '.config/google-chrome-beta/DevToolsActivePort'),
+    resolve(home, '.config/google-chrome-beta/Default/DevToolsActivePort'),
+    resolve(home, '.config/chromium/DevToolsActivePort'),
+    resolve(home, '.config/chromium/Default/DevToolsActivePort'),
+    resolve(home, '.config/BraveSoftware/Brave-Browser/DevToolsActivePort'),
+    resolve(home, '.config/BraveSoftware/Brave-Browser/Default/DevToolsActivePort'),
+    resolve(home, '.config/microsoft-edge/DevToolsActivePort'),
+    resolve(home, '.config/microsoft-edge/Default/DevToolsActivePort'),
+  ].filter(Boolean);
+  return [...new Set(candidates)];
+}
+
+function readWsUrlFromPortFile(portFile) {
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+  if (lines.length < 2 || !lines[0] || !lines[1]) {
+    throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
+  }
   return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+}
+
+function getWsUrlCandidates() {
+  const existing = getPortFileCandidates().filter(path => existsSync(path));
+  return existing.map(portFile => ({
+    portFile,
+    wsUrl: readWsUrlFromPortFile(portFile),
+  }));
+}
+
+async function connectToChrome(cdp) {
+  const candidates = getWsUrlCandidates();
+  if (candidates.length === 0) {
+    throw new Error(`Could not find DevToolsActivePort file in: ${getPortFileCandidates().join(', ')}`);
+  }
+
+  const errors = [];
+  for (const { portFile, wsUrl } of candidates) {
+    try {
+      await cdp.connect(wsUrl);
+      return { wsUrl, portFile };
+    } catch (e) {
+      errors.push(`${portFile}: ${e.message}`);
+    }
+  }
+
+  throw new Error(`Could not connect to Chrome via DevToolsActivePort candidates:\n${errors.join('\n')}`);
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -436,7 +490,7 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await connectToChrome(cdp);
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -756,7 +810,7 @@ async function main() {
     if (!pages) {
       // No daemon running — connect directly (will trigger one Allow)
       const cdp = new CDP();
-      await cdp.connect(getWsUrl());
+      await connectToChrome(cdp);
       pages = await getPages(cdp);
       cdp.close();
     }
