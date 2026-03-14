@@ -13,6 +13,9 @@
     "devtools"
   ],
   "license": "MIT",
+  "scripts": {
+    "test": "node --test skills/chrome-cdp/scripts/cdp.test.mjs"
+  },
   "files": [
     "skills/",
     "README.md"
