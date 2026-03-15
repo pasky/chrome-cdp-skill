@@ -7,10 +7,11 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
-import { homedir } from 'os';
-import { resolve } from 'path';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, renameSync } from 'fs';
+import { homedir, tmpdir } from 'os';
+import { resolve, join } from 'path';
 import { spawn } from 'child_process';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import net from 'net';
 
 const TIMEOUT = 15000;
@@ -19,10 +20,11 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const SOCK_PREFIX = '/tmp/cdp-';
-const PAGES_CACHE = '/tmp/cdp-pages.json';
+const PORT_PREFIX = 'cdp-';
+const PORT_SUFFIX = '.port';
+const PAGES_CACHE = join(tmpdir(), 'cdp-pages.json');
 
-function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
+function portFilePath(targetId) { return join(tmpdir(), `${PORT_PREFIX}${targetId}${PORT_SUFFIX}`); }
 
 function getWsUrl() {
   const candidates = [
@@ -37,13 +39,34 @@ function getWsUrl() {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function listDaemonSockets() {
-  return readdirSync('/tmp')
-    .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
-    .map(f => ({
-      targetId: f.slice(4, -5),
-      socketPath: `/tmp/${f}`,
-    }));
+function listDaemonPortFiles() {
+  const tmp = tmpdir();
+  return readdirSync(tmp)
+    .filter(f => f.startsWith(PORT_PREFIX) && f.endsWith(PORT_SUFFIX) && f !== 'cdp-pages.json')
+    .map(f => {
+      const targetId = f.slice(PORT_PREFIX.length, -PORT_SUFFIX.length);
+      const filePath = join(tmp, f);
+      try {
+        const data = JSON.parse(readFileSync(filePath, 'utf8'));
+        // Check if the daemon process is still alive
+        try {
+          process.kill(data.pid, 0);
+        } catch (e) {
+          if (e.code !== 'EPERM') {
+            // Process is dead — clean up stale port file
+            try { unlinkSync(filePath); } catch {}
+            return null;
+          }
+          // EPERM means process exists but owned by different user — treat as alive
+        }
+        return { targetId, filePath, ...data };
+      } catch {
+        // Corrupt or unreadable port file — clean up
+        try { unlinkSync(filePath); } catch {}
+        return null;
+      }
+    })
+    .filter(Boolean);
 }
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
@@ -428,11 +451,22 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 }
 
 // ---------------------------------------------------------------------------
+// Atomic port file write
+// ---------------------------------------------------------------------------
+
+function writePortFileAtomically(filePath, data) {
+  const tmpFile = filePath + `.tmp.${process.pid}`;
+  writeFileSync(tmpFile, JSON.stringify(data), { mode: 0o600 });
+  renameSync(tmpFile, filePath);
+}
+
+// ---------------------------------------------------------------------------
 // Per-tab daemon
 // ---------------------------------------------------------------------------
 
 async function runDaemon(targetId) {
-  const sp = sockPath(targetId);
+  const pfPath = portFilePath(targetId);
+  const authToken = randomBytes(16).toString('hex');
 
   const cdp = new CDP();
   try {
@@ -457,8 +491,8 @@ async function runDaemon(targetId) {
   function shutdown() {
     if (!alive) return;
     alive = false;
+    try { unlinkSync(pfPath); } catch {}
     server.close();
-    try { unlinkSync(sp); } catch {}
     cdp.close();
     process.exit(0);
   }
@@ -473,6 +507,7 @@ async function runDaemon(targetId) {
   cdp.onClose(() => shutdown());
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  process.on('exit', () => { try { unlinkSync(pfPath); } catch {} });
 
   // Idle timer
   let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
@@ -517,15 +552,18 @@ async function runDaemon(targetId) {
     }
   }
 
-  // Unix socket server — NDJSON protocol
+  // TCP localhost server — NDJSON protocol with auth token
   // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
+  // First message from client MUST be: { "token": "<authToken>" }
   // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
   //           or { "id": <number>, "ok": false, "error": "<message>" }
   const server = net.createServer((conn) => {
+    let authenticated = false;
     let buf = '';
-    conn.on('data', (chunk) => {
-      buf += chunk.toString();
+    const authTimeout = setTimeout(() => conn.destroy(), 5000);
+
+    function processLines() {
       const lines = buf.split('\n');
       buf = lines.pop(); // keep incomplete last line
       for (const line of lines) {
@@ -543,32 +581,95 @@ async function runDaemon(targetId) {
           else conn.write(payload);
         });
       }
+    }
+
+    conn.on('data', (chunk) => {
+      buf += chunk.toString();
+      if (authenticated) {
+        processLines();
+        return;
+      }
+      // Wait for auth line
+      const nl = buf.indexOf('\n');
+      if (nl === -1) return;
+      clearTimeout(authTimeout);
+      const authLine = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      try {
+        const msg = JSON.parse(authLine);
+        if (msg.token &&
+            Buffer.byteLength(msg.token, 'hex') === 16 &&
+            timingSafeEqual(
+              Buffer.from(msg.token, 'hex'),
+              Buffer.from(authToken, 'hex')
+            )) {
+          authenticated = true;
+          // Process any remaining data after the auth line
+          if (buf.length > 0) processLines();
+        } else {
+          conn.destroy();
+        }
+      } catch {
+        conn.destroy();
+      }
     });
   });
 
-  try { unlinkSync(sp); } catch {}
-  server.listen(sp);
+  server.listen(0, '127.0.0.1', () => {
+    const { port } = server.address();
+    writePortFileAtomically(pfPath, {
+      port,
+      pid: process.pid,
+      token: authToken,
+      ts: Date.now(),
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
 // CLI ↔ daemon communication
 // ---------------------------------------------------------------------------
 
-function connectToSocket(sp) {
+function connectToDaemon(daemonInfo) {
   return new Promise((resolve, reject) => {
-    const conn = net.connect(sp);
-    conn.on('connect', () => resolve(conn));
+    const conn = net.connect({ port: daemonInfo.port, host: '127.0.0.1' });
+    conn.on('connect', () => {
+      // Send auth token as first line
+      conn.write(JSON.stringify({ token: daemonInfo.token }) + '\n');
+      resolve(conn);
+    });
     conn.on('error', reject);
   });
 }
 
-async function getOrStartTabDaemon(targetId) {
-  const sp = sockPath(targetId);
-  // Try existing daemon
-  try { return await connectToSocket(sp); } catch {}
+function readPortFile(pfPath) {
+  try {
+    return JSON.parse(readFileSync(pfPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
 
-  // Clean stale socket
-  try { unlinkSync(sp); } catch {}
+async function getOrStartTabDaemon(targetId) {
+  const pfPath = portFilePath(targetId);
+
+  // Try existing daemon
+  const existing = readPortFile(pfPath);
+  if (existing) {
+    try {
+      // Check if process is alive
+      process.kill(existing.pid, 0);
+      return await connectToDaemon(existing);
+    } catch (e) {
+      if (e.code !== 'EPERM') {
+        // Process is dead — clean up stale port file
+        try { unlinkSync(pfPath); } catch {}
+      } else {
+        // Process exists (different user) — try connecting anyway
+        try { return await connectToDaemon(existing); } catch {}
+      }
+    }
+  }
 
   // Spawn daemon
   const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
@@ -577,10 +678,13 @@ async function getOrStartTabDaemon(targetId) {
   });
   child.unref();
 
-  // Wait for socket (includes time for user to click Allow)
+  // Wait for port file to appear (includes time for user to click Allow)
   for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
     await sleep(DAEMON_CONNECT_DELAY);
-    try { return await connectToSocket(sp); } catch {}
+    const data = readPortFile(pfPath);
+    if (data) {
+      try { return await connectToDaemon(data); } catch {}
+    }
   }
   throw new Error('Daemon failed to start — did you click Allow in Chrome?');
 }
@@ -637,9 +741,10 @@ function sendCommand(conn, req) {
   });
 }
 
-// Find any running daemon socket to reuse for list
-function findAnyDaemonSocket() {
-  return listDaemonSockets()[0]?.socketPath || null;
+// Find any running daemon to reuse for list
+function findAnyDaemonPortFile() {
+  const daemons = listDaemonPortFiles();
+  return daemons.length > 0 ? daemons[0] : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,26 +752,26 @@ function findAnyDaemonSocket() {
 // ---------------------------------------------------------------------------
 
 async function stopDaemons(targetPrefix) {
-  const daemons = listDaemonSockets();
+  const daemons = listDaemonPortFiles();
 
   if (targetPrefix) {
     const targetId = resolvePrefix(targetPrefix, daemons.map(d => d.targetId), 'daemon');
     const daemon = daemons.find(d => d.targetId === targetId);
     try {
-      const conn = await connectToSocket(daemon.socketPath);
+      const conn = await connectToDaemon(daemon);
       await sendCommand(conn, { cmd: 'stop' });
     } catch {
-      try { unlinkSync(daemon.socketPath); } catch {}
+      try { unlinkSync(daemon.filePath); } catch {}
     }
     return;
   }
 
   for (const daemon of daemons) {
     try {
-      const conn = await connectToSocket(daemon.socketPath);
+      const conn = await connectToDaemon(daemon);
       await sendCommand(conn, { cmd: 'stop' });
     } catch {
-      try { unlinkSync(daemon.socketPath); } catch {}
+      try { unlinkSync(daemon.filePath); } catch {}
     }
   }
 }
@@ -717,14 +822,20 @@ EVAL SAFETY NOTE
   collect all data in a single eval.
 
 DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
+  Each tab runs a persistent daemon on TCP localhost (127.0.0.1) with an
+  ephemeral port. Connection info is stored in: ${tmpdir()}/cdp-<fullTargetId>.port
+  The port file contains JSON: {"port":<number>, "pid":<number>, "token":"<hex>", "ts":<ms>}
+
+  To connect: open a TCP connection to 127.0.0.1:<port>, then send the auth
+  token as the first line: {"token":"<hex>"}\\n
+
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The daemon exits after 20 min of inactivity or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
@@ -745,10 +856,10 @@ async function main() {
   // List — use existing daemon if available, otherwise direct
   if (cmd === 'list' || cmd === 'ls') {
     let pages;
-    const existingSock = findAnyDaemonSocket();
-    if (existingSock) {
+    const existingDaemon = findAnyDaemonPortFile();
+    if (existingDaemon) {
       try {
-        const conn = await connectToSocket(existingSock);
+        const conn = await connectToDaemon(existingDaemon);
         const resp = await sendCommand(conn, { cmd: 'list_raw' });
         if (resp.ok) pages = JSON.parse(resp.result);
       } catch {}
@@ -787,7 +898,7 @@ async function main() {
 
   // Resolve prefix → full targetId from cache or running daemon
   let targetId;
-  const daemonTargetIds = listDaemonSockets().map(d => d.targetId);
+  const daemonTargetIds = listDaemonPortFiles().map(d => d.targetId);
   const daemonMatches = daemonTargetIds.filter(id => id.toUpperCase().startsWith(targetPrefix.toUpperCase()));
 
   if (daemonMatches.length > 0) {
