@@ -8,10 +8,13 @@
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync } from 'fs';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
+
+const IS_WINDOWS = process.platform === 'win32';
+const TMP = tmpdir().replace(/\\/g, '/');
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -19,13 +22,17 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const SOCK_PREFIX = '/tmp/cdp-';
-const PAGES_CACHE = '/tmp/cdp-pages.json';
+// Windows uses named pipes; Unix uses domain sockets
+const SOCK_PREFIX = IS_WINDOWS ? '\\\\.\\pipe\\cdp-' : `${TMP}/cdp-`;
+const PAGES_CACHE = `${TMP}/cdp-pages.json`;
 
-function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
+function sockPath(targetId) {
+  return IS_WINDOWS ? `${SOCK_PREFIX}${targetId}` : `${SOCK_PREFIX}${targetId}.sock`;
+}
 
 function getWsUrl() {
   const candidates = [
+    resolve(homedir(), 'AppData/Local/Google/Chrome/User Data/DevToolsActivePort'),
     resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
     resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
   ];
@@ -38,11 +45,12 @@ function getWsUrl() {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function listDaemonSockets() {
-  return readdirSync('/tmp')
+  if (IS_WINDOWS) return []; // named pipes have no filesystem listing
+  return readdirSync(TMP)
     .filter(f => f.startsWith('cdp-') && f.endsWith('.sock'))
     .map(f => ({
       targetId: f.slice(4, -5),
-      socketPath: `/tmp/${f}`,
+      socketPath: `${TMP}/${f}`,
     }));
 }
 
@@ -278,7 +286,7 @@ async function shotStr(cdp, sid, filePath) {
   }
 
   const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
-  const out = filePath || '/tmp/screenshot.png';
+  const out = filePath || `${TMP}/screenshot.png`;
   writeFileSync(out, Buffer.from(data, 'base64'));
 
   const lines = [out];
@@ -458,7 +466,7 @@ async function runDaemon(targetId) {
     if (!alive) return;
     alive = false;
     server.close();
-    try { unlinkSync(sp); } catch {}
+    if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
     cdp.close();
     process.exit(0);
   }
@@ -517,7 +525,7 @@ async function runDaemon(targetId) {
     }
   }
 
-  // Unix socket server — NDJSON protocol
+  // IPC server (Unix socket or Windows named pipe) — NDJSON protocol
   // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
   // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
@@ -546,7 +554,7 @@ async function runDaemon(targetId) {
     });
   });
 
-  try { unlinkSync(sp); } catch {}
+  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
   server.listen(sp);
 }
 
@@ -567,8 +575,8 @@ async function getOrStartTabDaemon(targetId) {
   // Try existing daemon
   try { return await connectToSocket(sp); } catch {}
 
-  // Clean stale socket
-  try { unlinkSync(sp); } catch {}
+  // Clean stale socket (Unix only — pipes auto-cleanup)
+  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
 
   // Spawn daemon
   const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
@@ -647,6 +655,22 @@ function findAnyDaemonSocket() {
 // ---------------------------------------------------------------------------
 
 async function stopDaemons(targetPrefix) {
+  // On Windows named pipes can't be enumerated — derive targets from pages cache instead
+  if (IS_WINDOWS) {
+    if (!existsSync(PAGES_CACHE)) return;
+    const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+    const targetIds = targetPrefix
+      ? [resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target')]
+      : pages.map(p => p.targetId);
+    for (const targetId of targetIds) {
+      try {
+        const conn = await connectToSocket(sockPath(targetId));
+        await sendCommand(conn, { cmd: 'stop' });
+      } catch {}
+    }
+    return;
+  }
+
   const daemons = listDaemonSockets();
 
   if (targetPrefix) {
@@ -682,7 +706,7 @@ Usage: cdp <command> [args]
   list                              List open pages (shows unique target prefixes)
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: /tmp/screenshot.png); prints coordinate mapping
+  shot  <target> [file]             Screenshot (default: screenshot.png in system temp dir); prints coordinate mapping
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
   net   <target>                    Network performance entries
@@ -717,14 +741,16 @@ EVAL SAFETY NOTE
   collect all data in a single eval.
 
 DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket: /tmp/cdp-<fullTargetId>.sock
+  Each tab runs a persistent daemon accessible via:
+    Unix/macOS:  <tmpdir>/cdp-<fullTargetId>.sock  (Unix domain socket)
+    Windows:     \\.\pipe\cdp-<fullTargetId>        (named pipe)
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The daemon exits after 20 min of inactivity or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
