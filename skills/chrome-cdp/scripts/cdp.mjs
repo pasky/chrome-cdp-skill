@@ -28,6 +28,7 @@ function getWsUrl() {
   const candidates = [
     resolve(homedir(), 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
     resolve(homedir(), '.config/google-chrome/DevToolsActivePort'),
+    resolve(homedir(), '.config/chromium/DevToolsActivePort'),
   ];
   const portFile = candidates.find(path => existsSync(path));
   if (!portFile) throw new Error(`Could not find DevToolsActivePort file in: ${candidates.join(', ')}`);
