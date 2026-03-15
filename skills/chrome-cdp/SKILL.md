@@ -12,8 +12,8 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 Multiple Chromium browsers may be running simultaneously. The skill must target the right one.
 
 **Priority order for browser selection:**
-1. **Project CLAUDE.md** — check for a `cdp-browser` setting (e.g. `cdp-browser: arc`). If found, use `--browser <value>` on all commands.
-2. **User instruction** — if the user says "use Chrome Canary" or "check my Arc tabs", use `--browser canary` or `--browser arc`.
+1. **Project CLAUDE.md** — check for a `cdp-browser` setting (e.g. `cdp-browser: canary`). If found, use `--browser <value>` on all commands.
+2. **User instruction** — if the user says "use Chrome Canary" or "check my Brave tabs", use `--browser canary` or `--browser brave`.
 3. **Ask the user** — on first invocation in a session where no preference is set, ask which browser to target. Remember the answer for the rest of the session.
 4. **Auto-discovery** — if none of the above apply, the CLI auto-detects the first running browser.
 
@@ -21,11 +21,11 @@ Multiple Chromium browsers may be running simultaneously. The skill must target 
 
 **Usage:** Prepend `--browser <name>` before the command:
 ```bash
-${CLAUDE_SKILL_DIR}/scripts/cdp.mjs --browser arc list
+${CLAUDE_SKILL_DIR}/scripts/cdp.mjs --browser chrome list
 ${CLAUDE_SKILL_DIR}/scripts/cdp.mjs --browser canary snap <target>
 ```
 
-Or set `CDP_BROWSER=arc` as environment variable for the session.
+Or set `CDP_BROWSER=canary` as environment variable for the session.
 
 ## Prerequisites
 
