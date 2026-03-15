@@ -29,19 +29,50 @@ const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
 function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
 
+// Browser aliases → DevToolsActivePort paths (macOS + Linux)
+const BROWSER_ALIASES = {
+  chrome:   { mac: 'Google/Chrome',                    linux: 'google-chrome' },
+  canary:   { mac: 'Google/Chrome Canary',             linux: 'google-chrome-unstable' },
+  beta:     { mac: 'Google/Chrome Beta',               linux: 'google-chrome-beta' },
+  testing:  { mac: 'Google/Chrome for Testing',        linux: 'google-chrome-for-testing' },
+  chromium: { mac: 'Chromium',                         linux: 'chromium' },
+  brave:    { mac: 'BraveSoftware/Brave-Browser',      linux: 'BraveSoftware/Brave-Browser' },
+  edge:     { mac: 'Microsoft Edge',                   linux: 'microsoft-edge' },
+};
+
+// Global browser filter set by --browser flag or CDP_BROWSER env
+let browserFilter = process.env.CDP_BROWSER || null;
+
 function getWsUrl() {
   const home = homedir();
-  // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
-  const macBrowsers = [
-    'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
-    'Chromium', 'BraveSoftware/Brave-Browser', 'Microsoft Edge',
-  ];
-  // Linux: ~/.config/<name>/DevToolsActivePort
-  const linuxBrowsers = [
-    'google-chrome', 'google-chrome-beta', 'chromium',
-    'vivaldi', 'vivaldi-snapshot',
-    'BraveSoftware/Brave-Browser', 'microsoft-edge',
-  ];
+
+  // If a specific browser is requested, only look for that one
+  if (browserFilter) {
+    const alias = BROWSER_ALIASES[browserFilter.toLowerCase()];
+    if (!alias) {
+      const available = Object.keys(BROWSER_ALIASES).join(', ');
+      throw new Error(`Unknown browser "${browserFilter}". Available: ${available}`);
+    }
+    const candidates = [];
+    if (process.env.CDP_PORT_FILE) candidates.push(process.env.CDP_PORT_FILE);
+    if (alias.mac) {
+      candidates.push(resolve(home, 'Library/Application Support', alias.mac, 'DevToolsActivePort'));
+      candidates.push(resolve(home, 'Library/Application Support', alias.mac, 'Default/DevToolsActivePort'));
+    }
+    if (alias.linux) {
+      candidates.push(resolve(home, '.config', alias.linux, 'DevToolsActivePort'));
+      candidates.push(resolve(home, '.config', alias.linux, 'Default/DevToolsActivePort'));
+    }
+    const portFile = candidates.find(p => existsSync(p));
+    if (!portFile) throw new Error(`Browser "${browserFilter}" not found or remote debugging not enabled. Enable at chrome://inspect/#remote-debugging`);
+    const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+    if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
+    return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  }
+
+  // Auto-discovery: scan all known browsers, return first match
+  const macBrowsers = Object.values(BROWSER_ALIASES).map(a => a.mac).filter(Boolean);
+  const linuxBrowsers = Object.values(BROWSER_ALIASES).map(a => a.linux).filter(Boolean);
   const candidates = [
     process.env.CDP_PORT_FILE,
     ...macBrowsers.flatMap(b => [
@@ -768,7 +799,14 @@ const NEEDS_TARGET = new Set([
 ]);
 
 async function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  // Extract --browser flag before parsing command
+  const rawArgs = process.argv.slice(2);
+  const browserIdx = rawArgs.indexOf('--browser');
+  if (browserIdx !== -1) {
+    browserFilter = rawArgs[browserIdx + 1];
+    rawArgs.splice(browserIdx, 2);
+  }
+  const [cmd, ...args] = rawArgs;
 
   // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }

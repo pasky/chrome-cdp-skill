@@ -7,9 +7,22 @@ description: Interact with local Chrome browser session (only on explicit user a
 
 Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection.
 
+## Browser Selection
+
+When multiple Chromium-based browsers are running, use `--browser <name>` to target a specific one:
+
+```bash
+scripts/cdp.mjs --browser canary list
+scripts/cdp.mjs --browser chrome snap <target>
+```
+
+**Available values:** `chrome`, `canary`, `beta`, `testing`, `chromium`, `brave`, `edge`
+
+Alternatively, set `CDP_BROWSER=canary` as environment variable. Without `--browser`, the CLI auto-detects the first running browser.
+
 ## Prerequisites
 
-- Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
+- Chrome (or Chromium, Brave, Edge) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
 - Node.js 22+ (uses built-in WebSocket)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
 
