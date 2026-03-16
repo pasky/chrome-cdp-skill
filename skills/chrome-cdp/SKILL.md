@@ -12,6 +12,9 @@ Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch
 - Node.js 22+ (uses built-in WebSocket)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
+- On WSL, the CLI also probes Windows browser profiles under `/mnt/c/Users/*/AppData/Local/.../User Data/DevToolsActivePort`
+- On WSL, set `CDP_WINDOWS_HOME=/mnt/c/Users/<WindowsUser>` to restrict discovery to a specific Windows profile root when needed
+- If your WSL networking does not expose the Windows debugging port on `127.0.0.1`, set `CDP_HOST` to a reachable Windows host address
 
 ## Commands
 

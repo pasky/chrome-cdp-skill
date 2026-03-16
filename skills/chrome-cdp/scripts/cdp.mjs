@@ -7,7 +7,7 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -20,6 +20,7 @@ const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
+const IS_WSL = detectWsl();
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
   ? resolve(homedir(), '.cache', 'cdp')
@@ -35,6 +36,43 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
+function detectWsl() {
+  if (process.platform !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return true;
+
+  for (const probe of ['/proc/sys/kernel/osrelease', '/proc/version']) {
+    try {
+      if (readFileSync(probe, 'utf8').toLowerCase().includes('microsoft')) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function browserPortFiles(baseDir) {
+  return [
+    resolve(baseDir, 'DevToolsActivePort'),
+    resolve(baseDir, 'Default', 'DevToolsActivePort'),
+  ];
+}
+
+function getWslWindowsHomes() {
+  const homes = [];
+  if (process.env.CDP_WINDOWS_HOME) homes.push(process.env.CDP_WINDOWS_HOME);
+
+  const usersDir = '/mnt/c/Users';
+  if (!existsSync(usersDir)) return homes;
+
+  const excluded = new Set(['All Users', 'Default', 'Default User', 'Public']);
+  try {
+    for (const entry of readdirSync(usersDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || excluded.has(entry.name)) continue;
+      homes.push(resolve(usersDir, entry.name));
+    }
+  } catch {}
+
+  return [...new Set(homes)];
+}
+
 function getWsUrl() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
@@ -48,27 +86,47 @@ function getWsUrl() {
     'vivaldi', 'vivaldi-snapshot',
     'BraveSoftware/Brave-Browser', 'microsoft-edge',
   ];
-  const candidates = [
-    process.env.CDP_PORT_FILE,
-    ...macBrowsers.flatMap(b => [
-      resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
-      resolve(home, 'Library/Application Support', b, 'Default/DevToolsActivePort'),
-    ]),
-    ...linuxBrowsers.flatMap(b => [
-      resolve(home, '.config', b, 'DevToolsActivePort'),
-      resolve(home, '.config', b, 'Default/DevToolsActivePort'),
-    ]),
-    // Windows: ~/AppData/Local/<name>/User Data/DevToolsActivePort
-    ...['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => [
-      resolve(home, 'AppData/Local', b, 'User Data/DevToolsActivePort'),
-      resolve(home, 'AppData/Local', b, 'User Data/Default/DevToolsActivePort'),
-    ]),
-  ].filter(Boolean);
-  const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
+  const windowsBrowsers = [
+    'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
+    'Chromium', 'Vivaldi', 'Vivaldi Snapshot',
+    'BraveSoftware/Brave-Browser', 'Microsoft/Edge',
+  ];
+
+  const candidates = [process.env.CDP_PORT_FILE];
+  if (process.platform === 'darwin') {
+    candidates.push(...macBrowsers.flatMap(b =>
+      browserPortFiles(resolve(home, 'Library/Application Support', b))
+    ));
+  } else if (IS_WINDOWS) {
+    candidates.push(...windowsBrowsers.flatMap(b =>
+      browserPortFiles(resolve(home, 'AppData/Local', b, 'User Data'))
+    ));
+  } else if (IS_WSL) {
+    candidates.push(...getWslWindowsHomes().flatMap(winHome =>
+      windowsBrowsers.flatMap(b =>
+        browserPortFiles(resolve(winHome, 'AppData/Local', b, 'User Data'))
+      )
+    ));
+    candidates.push(...linuxBrowsers.flatMap(b =>
+      browserPortFiles(resolve(home, '.config', b))
+    ));
+  } else {
+    candidates.push(...linuxBrowsers.flatMap(b =>
+      browserPortFiles(resolve(home, '.config', b))
+    ));
+  }
+
+  const portFile = candidates.filter(Boolean).find(p => existsSync(p));
+  if (!portFile) {
+    const wslHint = IS_WSL
+      ? ' In WSL, Windows Chrome is discovered under /mnt/c/Users/*/AppData/Local/...; set CDP_PORT_FILE if you use a custom Windows profile path.'
+      : '';
+    throw new Error(`No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging.${wslHint}`);
+  }
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  const host = process.env.CDP_HOST || '127.0.0.1';
+  return `ws://${host}:${lines[0]}${lines[1]}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
