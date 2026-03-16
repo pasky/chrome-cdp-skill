@@ -20,22 +20,28 @@ const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
+const LOCAL_APP_DATA = process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local');
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
-  ? resolve(homedir(), '.cache', 'cdp')
+  ? resolve(LOCAL_APP_DATA, 'cdp')
   : process.env.XDG_RUNTIME_DIR
     ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
     : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
+function safeTargetId(targetId) {
+  return targetId.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function sockPath(targetId) {
   return IS_WINDOWS
-    ? `\\\\.\\pipe\\cdp-${targetId}`
+    ? `\\\\.\\pipe\\cdp-${safeTargetId(targetId)}`
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
 function getWsUrl() {
+  if (process.env.CDP_WS_URL) return process.env.CDP_WS_URL;
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -48,8 +54,18 @@ function getWsUrl() {
     'vivaldi', 'vivaldi-snapshot',
     'BraveSoftware/Brave-Browser', 'microsoft-edge',
   ];
+  const windowsBrowsers = [
+    resolve(LOCAL_APP_DATA, 'Google', 'Chrome', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'Google', 'Chrome SxS', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'Google', 'Chrome for Testing', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'Chromium', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'BraveSoftware', 'Brave-Browser', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'Microsoft', 'Edge', 'User Data', 'DevToolsActivePort'),
+    resolve(LOCAL_APP_DATA, 'Vivaldi', 'User Data', 'DevToolsActivePort'),
+  ];
   const candidates = [
     process.env.CDP_PORT_FILE,
+    ...windowsBrowsers,
     ...macBrowsers.flatMap(b => [
       resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
       resolve(home, 'Library/Application Support', b, 'Default/DevToolsActivePort'),
@@ -57,11 +73,6 @@ function getWsUrl() {
     ...linuxBrowsers.flatMap(b => [
       resolve(home, '.config', b, 'DevToolsActivePort'),
       resolve(home, '.config', b, 'Default/DevToolsActivePort'),
-    ]),
-    // Windows: ~/AppData/Local/<name>/User Data/DevToolsActivePort
-    ...['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => [
-      resolve(home, 'AppData/Local', b, 'User Data/DevToolsActivePort'),
-      resolve(home, 'AppData/Local', b, 'User Data/Default/DevToolsActivePort'),
     ]),
   ].filter(Boolean);
   const portFile = candidates.find(p => existsSync(p));
@@ -580,6 +591,11 @@ async function runDaemon(targetId) {
         });
       }
     });
+  });
+
+  server.on('error', (e) => {
+    process.stderr.write(`Daemon server listen failed: ${e.message}\n`);
+    process.exit(1);
   });
 
   if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
