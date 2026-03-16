@@ -30,6 +30,10 @@ Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's i
 
 The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Linux. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
 
+### WSL support
+
+If your agent runs inside **WSL** but the browser runs on **Windows**, `chrome-cdp` auto-detects the Windows `DevToolsActivePort` file via `/mnt/c` and uses a small PowerShell WebSocket bridge so the browser can remain bound to Windows loopback (`127.0.0.1`). If your Windows username differs from your WSL username, set `CDP_PORT_FILE` to the full `/mnt/c/Users/<WinUser>/…/DevToolsActivePort` path.
+
 ## Usage
 
 ```bash

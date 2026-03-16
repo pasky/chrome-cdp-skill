@@ -9,8 +9,9 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
-import { resolve } from 'path';
-import { spawn } from 'child_process';
+import { resolve, dirname } from 'path';
+import { spawn, spawnSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import net from 'net';
 
 const TIMEOUT = 15000;
@@ -28,6 +29,54 @@ const RUNTIME_DIR = IS_WINDOWS
     : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const WINDOWS_BRIDGE_SCRIPT = resolve(SCRIPT_DIR, 'cdp-ws-bridge.ps1');
+
+// ---------------------------------------------------------------------------
+// WSL detection & Windows Chrome discovery
+// ---------------------------------------------------------------------------
+
+let _isWsl;
+function isWsl() {
+  if (_isWsl !== undefined) return _isWsl;
+  _isWsl = process.platform === 'linux' && (
+    !!process.env.WSL_DISTRO_NAME ||
+    existsSync('/proc/sys/fs/binfmt_misc/WSLInterop') ||
+    (() => { try { return readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft'); } catch { return false; } })()
+  );
+  return _isWsl;
+}
+
+// In WSL, detect Windows Chrome's DevToolsActivePort via /mnt/c.
+// Returns { portFile, wsUrl } or null. Uses $USER directly — no powershell spawn.
+// If Windows username differs from WSL username, set CDP_PORT_FILE to the full path.
+function findWindowsChromeFromWsl() {
+  if (!isWsl()) return null;
+  const user = process.env.USER || '';
+  if (!user) return null;
+  const base = `/mnt/c/Users/${user}/AppData/Local`;
+  const dirs = [
+    'Google/Chrome/User Data',
+    'BraveSoftware/Brave-Browser/User Data',
+    'Microsoft/Edge/User Data',
+  ];
+  for (const dir of dirs) {
+    for (const sub of ['', 'Default']) {
+      const p = sub ? resolve(base, dir, sub, 'DevToolsActivePort') : resolve(base, dir, 'DevToolsActivePort');
+      if (!existsSync(p)) continue;
+      try {
+        const lines = readFileSync(p, 'utf8').trim().split(/\r?\n/);
+        if (lines[0] && lines[1]) {
+          return {
+            portFile: p,
+            wsUrl: `ws://127.0.0.1:${lines[0].trim()}${lines[1].trim()}`,
+          };
+        }
+      } catch {}
+    }
+  }
+  return null;
+}
 
 function sockPath(targetId) {
   return IS_WINDOWS
@@ -35,6 +84,8 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
+// Returns { wsUrl, needsBridge }.
+// needsBridge is true only in WSL when Chrome was found on the Windows filesystem.
 function getWsUrl() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
@@ -65,10 +116,16 @@ function getWsUrl() {
     ]),
   ].filter(Boolean);
   const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  return `ws://127.0.0.1:${lines[0]}${lines[1]}`;
+  if (portFile) {
+    const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+    if (lines.length >= 2 && lines[0] && lines[1]) {
+      return { wsUrl: `ws://127.0.0.1:${lines[0]}${lines[1]}`, needsBridge: false };
+    }
+  }
+  // WSL fallback: try Windows Chrome via /mnt/c
+  const win = findWindowsChromeFromWsl();
+  if (win) return { wsUrl: win.wsUrl, needsBridge: true };
+  throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -102,28 +159,75 @@ function getDisplayPrefixLength(targetIds) {
 // ---------------------------------------------------------------------------
 
 class CDP {
-  #ws; #id = 0; #pending = new Map(); #eventHandlers = new Map(); #closeHandlers = [];
+  #ws; #bridge; #bridgeStdoutBuf = ''; #bridgeStderr = '';
+  #id = 0; #pending = new Map(); #eventHandlers = new Map(); #closeHandlers = []; #didClose = false;
 
-  async connect(wsUrl) {
+  async connect(wsUrl, { useBridge = false } = {}) {
+    if (useBridge) return this.#connectWindowsBridge(wsUrl);
+    return this.#connectWebSocket(wsUrl);
+  }
+
+  #connectWebSocket(wsUrl) {
     return new Promise((res, rej) => {
       this.#ws = new WebSocket(wsUrl);
       this.#ws.onopen = () => res();
       this.#ws.onerror = (e) => rej(new Error('WebSocket error: ' + (e.message || e.type)));
-      this.#ws.onclose = () => this.#closeHandlers.forEach(h => h());
-      this.#ws.onmessage = (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.id && this.#pending.has(msg.id)) {
-          const { resolve, reject } = this.#pending.get(msg.id);
-          this.#pending.delete(msg.id);
-          if (msg.error) reject(new Error(msg.error.message));
-          else resolve(msg.result);
-        } else if (msg.method && this.#eventHandlers.has(msg.method)) {
-          for (const handler of [...this.#eventHandlers.get(msg.method)]) {
-            handler(msg.params || {}, msg);
-          }
-        }
-      };
+      this.#ws.onclose = () => this.#emitClose();
+      this.#ws.onmessage = (ev) => this.#handleMessage(ev.data);
     });
+  }
+
+  #connectWindowsBridge(wsUrl) {
+    return new Promise((resolve, reject) => {
+      const wslp = spawnSync('wslpath', ['-w', WINDOWS_BRIDGE_SCRIPT], { encoding: 'utf8' });
+      if (wslp.status !== 0) return reject(new Error(`wslpath failed: ${wslp.stderr?.trim() || 'unknown'}`));
+      const child = spawn('powershell.exe', [
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wslp.stdout.trim(), wsUrl,
+      ], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+      this.#bridge = child;
+      let ready = false, settled = false, stderrBuf = '';
+      child.stdout.setEncoding('utf8');
+      child.stderr.setEncoding('utf8');
+      child.stdout.on('data', (chunk) => {
+        this.#bridgeStdoutBuf += chunk;
+        const lines = this.#bridgeStdoutBuf.split('\n');
+        this.#bridgeStdoutBuf = lines.pop();
+        for (const line of lines) { if (line.trim()) this.#handleMessage(line); }
+      });
+      child.stderr.on('data', (chunk) => {
+        stderrBuf += chunk; this.#bridgeStderr += chunk;
+        for (const line of stderrBuf.split(/\r?\n/)) {
+          const t = line.trim(); if (!t) continue;
+          if (!ready && t === 'READY') { ready = true; settled = true; resolve(); }
+          else if (!ready && t.startsWith('ERROR:')) { settled = true; reject(new Error(t.slice(6).trim())); child.kill(); }
+        }
+        stderrBuf = stderrBuf.endsWith('\n') ? '' : stderrBuf.split(/\r?\n/).pop();
+      });
+      child.on('error', (e) => { if (!settled) { settled = true; reject(e); } });
+      child.on('close', (code, sig) => {
+        if (!settled) { settled = true; reject(new Error(this.#bridgeStderr.trim() || `bridge exited ${code}`)); }
+        this.#emitClose();
+      });
+    });
+  }
+
+  #handleMessage(payload) {
+    const msg = JSON.parse(String(payload));
+    if (msg.id && this.#pending.has(msg.id)) {
+      const { resolve, reject } = this.#pending.get(msg.id);
+      this.#pending.delete(msg.id);
+      if (msg.error) reject(new Error(msg.error.message));
+      else resolve(msg.result);
+    } else if (msg.method && this.#eventHandlers.has(msg.method)) {
+      for (const handler of [...this.#eventHandlers.get(msg.method)]) handler(msg.params || {}, msg);
+    }
+  }
+
+  #emitClose() {
+    if (this.#didClose) return;
+    this.#didClose = true;
+    for (const [id, p] of this.#pending.entries()) { p.reject(new Error('CDP connection closed')); this.#pending.delete(id); }
+    this.#closeHandlers.forEach(h => h());
   }
 
   send(method, params = {}, sessionId) {
@@ -132,7 +236,15 @@ class CDP {
       this.#pending.set(id, { resolve, reject });
       const msg = { id, method, params };
       if (sessionId) msg.sessionId = sessionId;
-      this.#ws.send(JSON.stringify(msg));
+      const payload = JSON.stringify(msg);
+      try {
+        if (this.#bridge) {
+          if (!this.#bridge.stdin.writable) throw new Error('Windows bridge is not writable');
+          this.#bridge.stdin.write(payload + '\n');
+        } else {
+          this.#ws.send(payload);
+        }
+      } catch (error) { this.#pending.delete(id); reject(error); return; }
       setTimeout(() => {
         if (this.#pending.has(id)) {
           this.#pending.delete(id);
@@ -183,7 +295,14 @@ class CDP {
   }
 
   onClose(handler) { this.#closeHandlers.push(handler); }
-  close() { this.#ws.close(); }
+  close() {
+    if (this.#bridge) {
+      try { this.#bridge.stdin.end(); } catch {}
+      try { this.#bridge.kill(); } catch {}
+      return;
+    }
+    this.#ws?.close();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +591,8 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    const { wsUrl, needsBridge } = getWsUrl();
+    await cdp.connect(wsUrl, { useBridge: needsBridge });
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -544,6 +664,12 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'open': {
+          const newUrl = args[0] || 'about:blank';
+          const { targetId: newTargetId } = await cdp.send('Target.createTarget', { url: newUrl });
+          result = JSON.stringify({ targetId: newTargetId, url: newUrl });
+          break;
+        }
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
@@ -596,6 +722,22 @@ function connectToSocket(sp) {
     conn.on('connect', () => resolve(conn));
     conn.on('error', reject);
   });
+}
+
+// Try to reach any running daemon. Returns { conn, sockPath, pages } or null.
+// Used as a fast path so list/open can avoid spawning a new bridge in WSL.
+async function tryExistingDaemon() {
+  if (!existsSync(PAGES_CACHE)) return null;
+  let cached;
+  try { cached = JSON.parse(readFileSync(PAGES_CACHE, 'utf8')); } catch { return null; }
+  for (const page of cached) {
+    const sp = sockPath(page.targetId);
+    try {
+      const conn = await connectToSocket(sp);
+      return { conn, sockPath: sp, pages: cached };
+    } catch {}
+  }
+  return null;
 }
 
 async function getOrStartTabDaemon(targetId) {
@@ -769,8 +911,23 @@ async function main() {
   }
 
   if (cmd === 'list' || cmd === 'ls') {
+    // Fast path: reuse existing daemon to avoid a new bridge in WSL.
+    const existing = await tryExistingDaemon();
+    if (existing) {
+      try {
+        const res = await sendCommand(existing.conn, { cmd: 'list_raw', args: [] });
+        if (res.ok) {
+          const pages = JSON.parse(res.result);
+          writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+          console.log(formatPageList(pages));
+          return;
+        }
+      } catch { /* daemon died — fall through */ }
+    }
+    // Fallback: browser-level connection.
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    const { wsUrl, needsBridge } = getWsUrl();
+    await cdp.connect(wsUrl, { useBridge: needsBridge });
     const pages = await getPages(cdp);
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
@@ -782,10 +939,32 @@ async function main() {
   // Open new tab
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
+    // Fast path: reuse existing daemon to avoid a new bridge in WSL.
+    const existing = await tryExistingDaemon();
+    if (existing) {
+      try {
+        const res = await sendCommand(existing.conn, { cmd: 'open', args: [url] });
+        if (res.ok) {
+          const { targetId } = JSON.parse(res.result);
+          let pages = existing.pages;
+          try {
+            const listConn = await connectToSocket(existing.sockPath);
+            const listRes = await sendCommand(listConn, { cmd: 'list_raw', args: [] });
+            if (listRes.ok) pages = JSON.parse(listRes.result);
+          } catch {}
+          if (!pages.some(p => p.targetId === targetId)) pages.push({ targetId, title: url, url });
+          writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+          console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
+          console.log('Note: this tab will need "Allow debugging?" approval on first access.');
+          return;
+        }
+      } catch { /* daemon died — fall through */ }
+    }
+    // Fallback: browser-level connection.
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    const { wsUrl, needsBridge } = getWsUrl();
+    await cdp.connect(wsUrl, { useBridge: needsBridge });
     const { targetId } = await cdp.send('Target.createTarget', { url });
-    // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
     if (!pages.some(p => p.targetId === targetId)) {
       pages.push({ targetId, title: url, url });
