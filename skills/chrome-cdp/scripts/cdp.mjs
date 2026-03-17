@@ -48,6 +48,14 @@ function getWsUrl() {
     'vivaldi', 'vivaldi-snapshot',
     'BraveSoftware/Brave-Browser', 'microsoft-edge',
   ];
+  // Linux Flatpak: ~/.var/app/<app-id>/config/<name>/DevToolsActivePort
+  const flatpakBrowsers = [
+    ['org.chromium.Chromium', 'chromium'],
+    ['com.google.Chrome', 'google-chrome'],
+    ['com.brave.Browser', 'BraveSoftware/Brave-Browser'],
+    ['com.microsoft.Edge', 'microsoft-edge'],
+    ['com.vivaldi.Vivaldi', 'vivaldi'],
+  ];
   const candidates = [
     process.env.CDP_PORT_FILE,
     ...macBrowsers.flatMap(b => [
@@ -57,6 +65,10 @@ function getWsUrl() {
     ...linuxBrowsers.flatMap(b => [
       resolve(home, '.config', b, 'DevToolsActivePort'),
       resolve(home, '.config', b, 'Default/DevToolsActivePort'),
+    ]),
+    ...flatpakBrowsers.flatMap(([appId, name]) => [
+      resolve(home, '.var/app', appId, 'config', name, 'DevToolsActivePort'),
+      resolve(home, '.var/app', appId, 'config', name, 'Default/DevToolsActivePort'),
     ]),
     // Windows: %LOCALAPPDATA%/<name>/User Data/DevToolsActivePort
     ...(IS_WINDOWS ? ['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => {
