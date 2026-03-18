@@ -41,6 +41,7 @@ function getWsUrl() {
   const macBrowsers = [
     'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
     'Chromium', 'BraveSoftware/Brave-Browser', 'Microsoft Edge',
+    'net.imput.helium'
   ];
   // Linux: ~/.config/<name>/DevToolsActivePort
   const linuxBrowsers = [
