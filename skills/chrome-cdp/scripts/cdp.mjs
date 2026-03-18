@@ -287,6 +287,8 @@ async function snapshotStr(cdp, sid, compact = false) {
 }
 
 async function evalStr(cdp, sid, expression) {
+  const blocked = checkDangerousPatterns(expression);
+  if (blocked) throw new Error(`Blocked dangerous pattern: ${blocked}`);
   await cdp.send('Runtime.enable', {}, sid);
   const result = await cdp.send('Runtime.evaluate', {
     expression, returnByValue: true, awaitPromise: true,
@@ -440,6 +442,67 @@ async function typeStr(cdp, sid, text) {
   return `Typed ${text.length} characters`;
 }
 
+// Safety patterns blocked from eval (ported from OGRE cdp-actions.ts)
+const DANGEROUS_JS_PATTERNS = [
+  'eval(', 'Function(', '__proto__', 'import(', '__lookupGetter__',
+  '__lookupSetter__', 'constructor.constructor', 'document.write', 'document.writeln',
+];
+
+function checkDangerousPatterns(code) {
+  for (const p of DANGEROUS_JS_PATTERNS) {
+    if (code.includes(p)) return p;
+  }
+  return null;
+}
+
+// Press keyboard key: 'Tab', 'Enter', 'Escape', 'ArrowDown', etc.
+async function pressStr(cdp, sid, key) {
+  if (!key) throw new Error('key required (e.g. Enter, Tab, Escape, ArrowDown)');
+  const KEY_MAP = {
+    Tab: { code: 'Tab', keyCode: 9 },
+    Enter: { code: 'Enter', keyCode: 13 },
+    Escape: { code: 'Escape', keyCode: 27 },
+    Space: { code: 'Space', keyCode: 32 },
+    ArrowLeft: { code: 'ArrowLeft', keyCode: 37 },
+    ArrowUp: { code: 'ArrowUp', keyCode: 38 },
+    ArrowRight: { code: 'ArrowRight', keyCode: 39 },
+    ArrowDown: { code: 'ArrowDown', keyCode: 40 },
+    Backspace: { code: 'Backspace', keyCode: 8 },
+    Delete: { code: 'Delete', keyCode: 46 },
+  };
+  const info = KEY_MAP[key] ?? { code: key, keyCode: 0 };
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code: info.code, windowsVirtualKeyCode: info.keyCode }, sid);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: info.code, windowsVirtualKeyCode: info.keyCode }, sid);
+  return `Pressed key: ${key}`;
+}
+
+// Write value into a CodeMirror editor (resolves from selector or wrapper div)
+async function codemirrorStr(cdp, sid, selector, value) {
+  if (!selector) throw new Error('CSS selector required');
+  if (value == null) throw new Error('value required');
+  const safeValue = JSON.stringify(value);
+  const esc = selector.replace(/'/g, "\\'");
+  const expression = `(function(val) {
+    try {
+      var el = document.querySelector('${esc}');
+      if (!el) return { ok: false, error: 'Element not found: ${esc}' };
+      var cm = el.CodeMirror
+        || (el.querySelector && el.querySelector('.CodeMirror') && el.querySelector('.CodeMirror').CodeMirror)
+        || (el.parentElement && el.parentElement.CodeMirror)
+        || (el.classList && el.classList.contains('CodeMirror') && el.CodeMirror);
+      if (!cm) return { ok: false, error: 'No CodeMirror instance found' };
+      cm.setValue(val);
+      cm.refresh();
+      return { ok: true, lines: cm.lineCount() };
+    } catch(e) { return { ok: false, error: e.message }; }
+  })(${safeValue})`;
+  await cdp.send('Runtime.enable', {}, sid);
+  const result = await cdp.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: false }, sid);
+  const val = result.result?.value;
+  if (val && !val.ok) throw new Error(val.error || 'CodeMirror write failed');
+  return `Wrote ${value.length} chars to CodeMirror (${val?.lines ?? '?'} lines)`;
+}
+
 // Load-more: repeatedly click a button/selector until it disappears
 async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   if (!selector) throw new Error('CSS selector required');
@@ -560,6 +623,8 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'press': result = await pressStr(cdp, sessionId, args[0]); break;
+        case 'codemirror': result = await codemirrorStr(cdp, sessionId, args[0], args.slice(1).join(' ')); break;
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
@@ -737,9 +802,11 @@ Usage: cdp <command> [args]
                                     Works in cross-origin iframes unlike eval-based approaches
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
-  evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
-                                    e.g. evalraw <t> "DOM.getDocument" '{}'
-  open  [url]                       Open a new tab (default: about:blank)
+  evalraw    <target> <method> [json]  Send a raw CDP command; returns JSON result
+                                       e.g. evalraw <t> "DOM.getDocument" '{}'
+  press      <target> <key>           Press a keyboard key (Tab, Enter, Escape, ArrowDown, etc.)
+  codemirror <target> <selector> <v>  Write value into a CodeMirror editor by CSS selector
+  open  [url]                         Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
 
@@ -777,6 +844,7 @@ DAEMON IPC (for advanced use / scripting)
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','loadall','evalraw',
+  'press','codemirror',
 ]);
 
 async function main() {
