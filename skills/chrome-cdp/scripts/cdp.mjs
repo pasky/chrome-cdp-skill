@@ -35,7 +35,7 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
-function getWsUrl() {
+async function getWsUrl() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -84,7 +84,18 @@ function getWsUrl() {
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   const host = process.env.CDP_HOST || '127.0.0.1';
-  return `ws://${host}:${lines[0]}${lines[1]}`;
+  const port = lines[0];
+
+  // The browser UUID in DevToolsActivePort can go stale (Chrome restart, new debug
+  // session, etc.). Prefer the live UUID from /json/version when reachable.
+  try {
+    const resp = await fetch(`http://${host}:${port}/json/version`);
+    const info = await resp.json();
+    if (info.webSocketDebuggerUrl) return info.webSocketDebuggerUrl;
+  } catch {}
+
+  // Fallback to file-based URL
+  return `ws://${host}:${port}${lines[1]}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -488,7 +499,7 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -791,7 +802,7 @@ async function main() {
 
   if (cmd === 'list' || cmd === 'ls') {
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
     const pages = await getPages(cdp);
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
@@ -804,7 +815,7 @@ async function main() {
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
     const { targetId } = await cdp.send('Target.createTarget', { url });
     // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
