@@ -10,7 +10,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import net from 'net';
 
 const TIMEOUT = 15000;
@@ -35,8 +35,40 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
+function isWsl() {
+  // Detect WSL by checking /proc/version for Microsoft or WSL
+  try {
+    const version = readFileSync('/proc/version', 'utf8').toLowerCase();
+    return version.includes('microsoft') || version.includes('wsl');
+  } catch {
+    return false;
+  }
+}
+
+function getWslLocalAppData() {
+  // Returns Windows LocalAppData as a Linux path for WSL2 host Chrome detection.
+  // Prefers %LOCALAPPDATA% directly; falls back to %USERPROFILE%\AppData\Local.
+  // stderr is suppressed to avoid UNC/AutoRun noise on some systems.
+  const winPathOf = (varExpr) => {
+    try {
+      return execFileSync('cmd.exe', ['/C', `echo ${varExpr}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).replace(/\r?\n$/, '');
+    } catch { return null; }
+  };
+  try {
+    const winPath = winPathOf('%LOCALAPPDATA%') || `${winPathOf('%USERPROFILE%')}\\AppData\\Local`;
+    if (!winPath) return null;
+    return execFileSync('wslpath', ['-u', winPath], { encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
+}
+
 function getWsUrl() {
   const home = homedir();
+  const wsl = isWsl();
+  const wslLocalAppData = wsl ? getWslLocalAppData() : null;
+
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
     'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
@@ -56,6 +88,16 @@ function getWsUrl() {
     ['com.microsoft.Edge', 'microsoft-edge'],
     ['com.vivaldi.Vivaldi', 'vivaldi'],
   ];
+
+  // Windows browsers (for WSL2 access to host Chrome)
+  const windowsBrowsers = [
+    'Google/Chrome',
+    'Google/Chrome Beta',
+    'Chromium',
+    'BraveSoftware/Brave-Browser',
+    'Microsoft/Edge',
+  ];
+
   const candidates = [
     process.env.CDP_PORT_FILE,
     ...macBrowsers.flatMap(b => [
@@ -71,16 +113,23 @@ function getWsUrl() {
       resolve(home, '.var/app', appId, 'config', name, 'Default/DevToolsActivePort'),
     ]),
     // Windows: %LOCALAPPDATA%/<name>/User Data/DevToolsActivePort
-    ...(IS_WINDOWS ? ['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => {
+    ...(IS_WINDOWS ? windowsBrowsers.flatMap(b => {
       const base = process.env.LOCALAPPDATA || resolve(home, 'AppData/Local');
       return [
         resolve(base, b, 'User Data/DevToolsActivePort'),
         resolve(base, b, 'User Data/Default/DevToolsActivePort'),
       ];
     }) : []),
+    // WSL2: Access Windows host Chrome via resolved LocalAppData path
+    ...(wsl && wslLocalAppData ? windowsBrowsers.flatMap(b => [
+      resolve(wslLocalAppData, b, 'User Data/DevToolsActivePort'),
+      resolve(wslLocalAppData, b, 'User Data/Default/DevToolsActivePort'),
+    ]) : []),
   ].filter(Boolean);
+
   const portFile = candidates.find(p => existsSync(p));
   if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
+
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   const host = process.env.CDP_HOST || '127.0.0.1';
