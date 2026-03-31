@@ -132,8 +132,8 @@ function getWsUrl() {
 
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  const ost = process.env.CDP_HOST || '127.0.0.1';
-   return `ws://${host}:${lines[0]}${lines[1]}`;
+  const host = process.env.CDP_HOST || '127.0.0.1';
+  return `ws://${host}:${lines[0]}${lines[1]}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
