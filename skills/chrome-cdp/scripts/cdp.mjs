@@ -3,9 +3,10 @@
 // Uses raw CDP over WebSocket, no Puppeteer dependency.
 // Requires Node 22+ (built-in WebSocket).
 //
-// Per-tab persistent daemon: page commands go through a daemon that holds
-// the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// Single browser daemon: all page commands go through one daemon that holds
+// a single CDP WebSocket connection to Chrome. Chrome's "Allow debugging"
+// modal fires once per daemon (= once per Chrome session). Daemon lives
+// until Chrome disconnects or "cdp stop" is called.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
@@ -15,7 +16,6 @@ import net from 'net';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
@@ -29,11 +29,10 @@ const RUNTIME_DIR = IS_WINDOWS
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
-function sockPath(targetId) {
-  return IS_WINDOWS
-    ? `\\\\.\\pipe\\cdp-${targetId}`
-    : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
-}
+// Single browser-level daemon socket (one per Chrome session)
+const BROWSER_SOCK = IS_WINDOWS
+  ? `\\\\.\\pipe\\cdp-browser`
+  : resolve(RUNTIME_DIR, 'cdp-browser.sock');
 
 function getWsUrl() {
   const home = homedir();
@@ -480,29 +479,23 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-tab daemon
+// Browser-level daemon (single WebSocket connection, manages all tab sessions)
 // ---------------------------------------------------------------------------
 
-async function runDaemon(targetId) {
-  const sp = sockPath(targetId);
+async function runBrowserDaemon() {
+  const sp = BROWSER_SOCK;
 
   const cdp = new CDP();
   try {
     await cdp.connect(getWsUrl());
   } catch (e) {
-    process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
+    process.stderr.write(`Browser daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
   }
 
-  let sessionId;
-  try {
-    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
-    sessionId = res.sessionId;
-  } catch (e) {
-    process.stderr.write(`Daemon: attach failed: ${e.message}\n`);
-    cdp.close();
-    process.exit(1);
-  }
+  // sessions: targetId → sessionId
+  // Populated via Target.attachedToTarget events (from setAutoAttach) + fallback attachToTarget
+  const sessions = new Map();
 
   // Shutdown helpers
   let alive = true;
@@ -515,27 +508,74 @@ async function runDaemon(targetId) {
     process.exit(0);
   }
 
-  // Exit if target goes away or Chrome disconnects
-  cdp.onEvent('Target.targetDestroyed', (params) => {
-    if (params.targetId === targetId) shutdown();
-  });
-  cdp.onEvent('Target.detachedFromTarget', (params) => {
-    if (params.sessionId === sessionId) shutdown();
-  });
+  // Exit if Chrome disconnects
   cdp.onClose(() => shutdown());
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  // Idle timer
-  let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
-  function resetIdle() {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+  // sessions: targetId → sessionId, populated by the two-level setAutoAttach below
+  // This mirrors exactly what Puppeteer does, which is why chrome-devtools-mcp
+  // never triggers the "Allow debugging?" popup.
+
+  // Level 2: when a page is attached from a tab session, store its sessionId
+  cdp.onEvent('Target.attachedToTarget', async (params) => {
+    const { sessionId, targetInfo } = params;
+    if (!sessionId || !targetInfo?.targetId) return;
+
+    if (targetInfo.type === 'tab') {
+      // Level 1 fired: a tab target was attached at browser level.
+      // Now set up page-level autoAttach on THIS tab's session (Level 2).
+      // Pages attached this way don't trigger the Allow popup.
+      try {
+        await cdp.send('Target.setAutoAttach', {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+          filter: [{}],
+        }, sessionId);
+      } catch {}
+    } else if (targetInfo.type === 'page') {
+      // Level 2 fired: a page was attached from a tab session → store it
+      sessions.set(targetInfo.targetId, sessionId);
+    }
+  });
+
+  // Clean up sessions when targets go away
+  cdp.onEvent('Target.targetDestroyed', (params) => {
+    sessions.delete(params.targetId);
+  });
+  cdp.onEvent('Target.detachedFromTarget', (params) => {
+    for (const [tid, sid] of sessions) {
+      if (sid === params.sessionId) { sessions.delete(tid); break; }
+    }
+  });
+
+  // Level 1: browser-level setAutoAttach, excluding page targets.
+  // Attach only to 'tab' targets (Chrome's tab wrapper) — same as Puppeteer.
+  // Direct browser→page attachment is what triggers the popup; this avoids it.
+  await cdp.send('Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: false,
+    flatten: true,
+    filter: [{ type: 'page', exclude: true }, {}],
+  });
+
+  // Get or wait for a session for a given targetId.
+  async function getSession(targetId) {
+    if (sessions.has(targetId)) return sessions.get(targetId);
+    // Wait up to 500ms for the two-level attach events to settle
+    for (let i = 0; i < 10; i++) {
+      await sleep(50);
+      if (sessions.has(targetId)) return sessions.get(targetId);
+    }
+    // Fallback for Chrome versions without 'tab' target support
+    const res = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+    sessions.set(targetId, res.sessionId);
+    return res.sessionId;
   }
 
-  // Handle a command
-  async function handleCommand({ cmd, args }) {
-    resetIdle();
+  // Handle a command; targetId is required for tab-specific commands
+  async function handleCommand({ cmd, targetId, args }) {
     try {
       let result;
       switch (cmd) {
@@ -549,19 +589,56 @@ async function runDaemon(targetId) {
           result = JSON.stringify(pages);
           break;
         }
-        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
-        case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
-        case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
-        case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
-        case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-        case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
-        case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
-        case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
-        case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-        case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'open': {
+          const url = args[0] || 'about:blank';
+          const { targetId } = await cdp.send('Target.createTarget', { url });
+          const pages = await getPages(cdp);
+          if (!pages.some(p => p.targetId === targetId)) {
+            pages.push({ targetId, title: url, url });
+          }
+          result = JSON.stringify({ targetId, pages });
+          break;
+        }
         case 'stop': return { ok: true, result: '', stopAfter: true };
-        default: return { ok: false, error: `Unknown command: ${cmd}` };
+        default: {
+          if (!targetId) return { ok: false, error: 'targetId required for this command' };
+          let sid;
+          try {
+            sid = await getSession(targetId);
+          } catch (e) {
+            return { ok: false, error: `Failed to attach to tab: ${e.message}` };
+          }
+          // Execute command; on session error, evict cache and retry once
+          const run = async (sessionId) => {
+            switch (cmd) {
+              case 'snap': case 'snapshot': return snapshotStr(cdp, sessionId, true);
+              case 'eval': return evalStr(cdp, sessionId, args[0]);
+              case 'shot': case 'screenshot': return shotStr(cdp, sessionId, args[0], targetId);
+              case 'html': return htmlStr(cdp, sessionId, args[0]);
+              case 'nav': case 'navigate': return navStr(cdp, sessionId, args[0]);
+              case 'net': case 'network': return netStr(cdp, sessionId);
+              case 'click': return clickStr(cdp, sessionId, args[0]);
+              case 'clickxy': return clickXyStr(cdp, sessionId, args[0], args[1]);
+              case 'type': return typeStr(cdp, sessionId, args[0]);
+              case 'loadall': return loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500);
+              case 'evalraw': return evalRawStr(cdp, sessionId, args[0], args[1]);
+              default: throw new Error(`Unknown command: ${cmd}`);
+            }
+          };
+          try {
+            result = await run(sid);
+          } catch (e) {
+            // If session is stale, re-attach once
+            if (/session|Session|detach|Detach/.test(e.message)) {
+              sessions.delete(targetId);
+              sid = await getSession(targetId);
+              result = await run(sid);
+            } else {
+              throw e;
+            }
+          }
+          break;
+        }
       }
       return { ok: true, result: result ?? '' };
     } catch (e) {
@@ -571,7 +648,7 @@ async function runDaemon(targetId) {
 
   // Unix socket server — NDJSON protocol
   // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
-  // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
+  // Request:  { "id": <number>, "cmd": "<command>", "targetId": "<id>", "args": ["arg1", ...] }
   // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
   //           or { "id": <number>, "ok": false, "error": "<message>" }
   const server = net.createServer((conn) => {
@@ -599,7 +676,7 @@ async function runDaemon(targetId) {
   });
 
   server.on('error', (e) => {
-    process.stderr.write(`Daemon server listen failed: ${e.message}\n`);
+    process.stderr.write(`Browser daemon server listen failed: ${e.message}\n`);
     process.exit(1);
   });
 
@@ -619,16 +696,15 @@ function connectToSocket(sp) {
   });
 }
 
-async function getOrStartTabDaemon(targetId) {
-  const sp = sockPath(targetId);
-  // Try existing daemon
-  try { return await connectToSocket(sp); } catch {}
+async function getOrStartBrowserDaemon() {
+  // Try existing browser daemon
+  try { return await connectToSocket(BROWSER_SOCK); } catch {}
 
   // Clean stale socket
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+  if (!IS_WINDOWS) try { unlinkSync(BROWSER_SOCK); } catch {}
 
   // Spawn daemon
-  const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
+  const child = spawn(process.execPath, [process.argv[1], '_browser_daemon'], {
     detached: true,
     stdio: 'ignore',
   });
@@ -637,9 +713,9 @@ async function getOrStartTabDaemon(targetId) {
   // Wait for socket (includes time for user to click Allow)
   for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
     await sleep(DAEMON_CONNECT_DELAY);
-    try { return await connectToSocket(sp); } catch {}
+    try { return await connectToSocket(BROWSER_SOCK); } catch {}
   }
-  throw new Error('Daemon failed to start — did you click Allow in Chrome?');
+  throw new Error('Browser daemon failed to start — did you click Allow in Chrome?');
 }
 
 function sendCommand(conn, req) {
@@ -695,24 +771,15 @@ function sendCommand(conn, req) {
 }
 
 // ---------------------------------------------------------------------------
-// Stop daemons
+// Stop daemon
 // ---------------------------------------------------------------------------
 
-async function stopDaemons(targetPrefix) {
-  if (!existsSync(PAGES_CACHE)) return;
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targets = targetPrefix
-    ? [resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target')]
-    : pages.map(p => p.targetId);
-
-  for (const targetId of targets) {
-    const sp = sockPath(targetId);
-    try {
-      const conn = await connectToSocket(sp);
-      await sendCommand(conn, { cmd: 'stop' });
-    } catch {
-      if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-    }
+async function stopDaemon() {
+  try {
+    const conn = await connectToSocket(BROWSER_SOCK);
+    await sendCommand(conn, { cmd: 'stop' });
+  } catch {
+    if (!IS_WINDOWS) try { unlinkSync(BROWSER_SOCK); } catch {}
   }
 }
 
@@ -740,8 +807,7 @@ Usage: cdp <command> [args]
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   open  [url]                       Open a new tab (default: about:blank)
-                                    Note: each new tab triggers a fresh "Allow debugging?" prompt
-  stop  [target]                    Stop daemon(s)
+  stop                              Stop the browser daemon
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
@@ -764,14 +830,14 @@ EVAL SAFETY NOTE
   collect all data in a single eval.
 
 DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket in the runtime dir (see below).
+  A single browser daemon runs at Unix socket in the runtime dir (see below).
   Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-    Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
+    Request:  {"id":<number>, "cmd":"<command>", "targetId":"<id>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
   type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+  The socket disappears when Chrome disconnects or after "cdp stop".
 `;
 
 const NEEDS_TARGET = new Set([
@@ -783,44 +849,39 @@ async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
   // Daemon mode (internal)
-  if (cmd === '_daemon') { await runDaemon(args[0]); return; }
+  if (cmd === '_browser_daemon') { await runBrowserDaemon(); return; }
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);
   }
 
   if (cmd === 'list' || cmd === 'ls') {
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const pages = await getPages(cdp);
-    cdp.close();
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(formatPageList(pages));
-    setTimeout(() => process.exit(0), 100);
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd: 'list', args: [] });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    // Also refresh cache via list_raw
+    const conn2 = await getOrStartBrowserDaemon();
+    const raw = await sendCommand(conn2, { cmd: 'list_raw', args: [] });
+    if (raw.ok) writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
+    console.log(response.result);
     return;
   }
 
-  // Open new tab
+  // Open new tab — routed through daemon to reuse existing Chrome connection
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const { targetId } = await cdp.send('Target.createTarget', { url });
-    // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
-    const pages = await getPages(cdp);
-    if (!pages.some(p => p.targetId === targetId)) {
-      pages.push({ targetId, title: url, url });
-    }
-    cdp.close();
+    const conn = await getOrStartBrowserDaemon();
+    const response = await sendCommand(conn, { cmd: 'open', args: [url] });
+    if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
+    const { targetId, pages } = JSON.parse(response.result);
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
-    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
     return;
   }
 
   // Stop
   if (cmd === 'stop') {
-    await stopDaemons(args[0]);
+    await stopDaemon();
     return;
   }
 
@@ -845,7 +906,7 @@ async function main() {
   const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
   const targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
 
-  const conn = await getOrStartTabDaemon(targetId);
+  const conn = await getOrStartBrowserDaemon();
 
   const cmdArgs = args.slice(1);
 
@@ -869,7 +930,7 @@ async function main() {
     process.exit(1);
   }
 
-  const response = await sendCommand(conn, { cmd, args: cmdArgs });
+  const response = await sendCommand(conn, { cmd, targetId, args: cmdArgs });
 
   if (response.ok) {
     if (response.result) console.log(response.result);

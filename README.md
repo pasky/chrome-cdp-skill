@@ -28,7 +28,7 @@ Clone or copy the `skills/chrome-cdp/` directory wherever your agent loads skill
 
 Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's it.
 
-The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux, and Windows. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
+The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Linux, and Chrome, Brave, and Edge on Windows. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
 
 ## Usage
 
@@ -45,18 +45,18 @@ scripts/cdp.mjs clickxy <target> <x> <y>          # click at CSS pixel coordinat
 scripts/cdp.mjs type   <target> "text"            # type at focused element (works in cross-origin iframes)
 scripts/cdp.mjs loadall <target> "selector"       # click "load more" until gone
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open   [url]                      # open new tab (triggers Allow prompt)
-scripts/cdp.mjs stop   [target]                   # stop daemon(s)
+scripts/cdp.mjs open   [url]                      # open new tab via the browser daemon
+scripts/cdp.mjs stop                             # stop the browser daemon
 ```
 
 `<target>` is a unique prefix of the targetId shown by `list`.
 
 ## Why not chrome-devtools-mcp?
 
-[chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) reconnects on every command, so Chrome's "Allow debugging" modal can re-appear repeatedly and target enumeration times out with many tabs open. `chrome-cdp` holds one persistent daemon per tab — the modal fires once, and it handles 100+ tabs reliably.
+[chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp) reconnects on every command, so Chrome's "Allow debugging" modal can re-appear repeatedly and target enumeration times out with many tabs open. `chrome-cdp` holds one persistent browser daemon with a single CDP WebSocket connection, so the modal fires once per Chrome session and it handles 100+ tabs reliably.
 
 ## How it works
 
-Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. On first access to a tab, a lightweight background daemon is spawned that holds the session open. Chrome's "Allow debugging" modal appears once per tab; subsequent commands reuse the daemon silently. Daemons auto-exit after 20 minutes of inactivity.
+Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. A lightweight browser daemon keeps one CDP connection alive and manages tab sessions behind the scenes. Chrome's "Allow debugging" modal appears once per Chrome session; subsequent commands reuse the daemon silently. The daemon lives until Chrome disconnects or you run `scripts/cdp.mjs stop`.
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
