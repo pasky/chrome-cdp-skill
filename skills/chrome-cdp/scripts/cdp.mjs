@@ -35,7 +35,7 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
-function getWsUrl() {
+async function getWsUrl() {
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -80,11 +80,35 @@ function getWsUrl() {
     }) : []),
   ].filter(Boolean);
   const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
-  const lines = readFileSync(portFile, 'utf8').trim().split('\n');
-  if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  const host = process.env.CDP_HOST || '127.0.0.1';
-  return `ws://${host}:${lines[0]}${lines[1]}`;
+  if (portFile) {
+    const lines = readFileSync(portFile, 'utf8').trim().split('\n');
+    if (lines.length >= 2 && lines[0] && lines[1]) {
+      const host = process.env.CDP_HOST || '127.0.0.1';
+      return `ws://${host}:${lines[0]}${lines[1]}`;
+    }
+  }
+
+  // Fallback: CDP_PORT env var (for Termux / manual browser launch)
+  // When browser is started with --remote-debugging-port=N, there's no
+  // DevToolsActivePort file — discover the WebSocket URL via HTTP.
+  const cdpPort = process.env.CDP_PORT;
+  if (cdpPort) {
+    const host = process.env.CDP_HOST || '127.0.0.1';
+    try {
+      const resp = await fetch(`http://${host}:${cdpPort}/json/version`);
+      const data = await resp.json();
+      if (data.webSocketDebuggerUrl) return data.webSocketDebuggerUrl;
+    } catch (e) {
+      throw new Error(
+        `CDP_PORT=${cdpPort} but cannot connect to ${host}:${cdpPort}. ` +
+        `Is Chrome running with --remote-debugging-port=${cdpPort}?\n` +
+        `  e.g. chromium-browser --headless --no-sandbox --disable-gpu --remote-debugging-port=${cdpPort}\n` +
+        `  (${e.message})`
+      );
+    }
+  }
+
+  throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -488,7 +512,7 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -791,7 +815,7 @@ async function main() {
 
   if (cmd === 'list' || cmd === 'ls') {
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
     const pages = await getPages(cdp);
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
@@ -804,7 +828,7 @@ async function main() {
   if (cmd === 'open') {
     const url = args[0] || 'about:blank';
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
     const { targetId } = await cdp.send('Target.createTarget', { url });
     // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
