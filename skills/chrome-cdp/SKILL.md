@@ -38,6 +38,22 @@ Captures the **viewport only**. Scroll first with `eval` if you need content bel
 scripts/cdp.mjs snap <target>
 ```
 
+### Lightweight page inspection
+
+```bash
+scripts/cdp.mjs inspect <target> [selector]
+```
+
+Use `inspect` first for page state: title, URL, ready state, focus, visible controls, links, inputs, forms, headings, and a bounded text sample. Escalate to `snap` for full accessibility structure, `html` for raw markup, or `shot` for visual evidence.
+
+### Daemon stats
+
+```bash
+scripts/cdp.mjs stats
+```
+
+Shows browser daemon uptime, session/page counts, and recent command timings. Use this when local Chrome automation feels slow or resource-heavy.
+
 ### Evaluate JavaScript
 
 ```bash
@@ -50,6 +66,7 @@ scripts/cdp.mjs eval <target> <expr>
 
 ```bash
 scripts/cdp.mjs html    <target> [selector]   # full page or element HTML
+scripts/cdp.mjs inspect <target> [selector]   # lightweight page summary
 scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
 scripts/cdp.mjs net     <target>               # resource timing entries
 scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
@@ -58,6 +75,7 @@ scripts/cdp.mjs type    <target> <text>         # Input.insertText at current fo
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open new tab via the browser daemon
+scripts/cdp.mjs stats                          # daemon health and recent command timings
 scripts/cdp.mjs stop                           # stop the browser daemon
 ```
 
@@ -73,6 +91,7 @@ CSS px = screenshot image px / DPR
 
 ## Tips
 
-- Prefer `snap --compact` over `html` for page structure.
+- Prefer `inspect` for first-pass page state; use `snap` only when you need the full accessibility tree.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
+- Prefer one combined `eval` over many small `eval` calls when collecting structured page data.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`.
