@@ -34,6 +34,8 @@ The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS and Lin
 
 ```bash
 scripts/cdp.mjs list                              # list open tabs
+scripts/cdp.mjs stats                             # browser daemon health and recent command timings
+scripts/cdp.mjs inspect <target> [".selector"]    # lightweight page summary
 scripts/cdp.mjs shot   <target>                   # screenshot → runtime dir
 scripts/cdp.mjs snap   <target>                   # accessibility tree (compact, semantic)
 scripts/cdp.mjs html   <target> [".selector"]     # full HTML or scoped to CSS selector
@@ -60,3 +62,5 @@ scripts/cdp.mjs stop                             # stop the browser daemon
 Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no intermediary. A lightweight browser daemon keeps one CDP connection alive and manages tab sessions behind the scenes. Chrome's "Allow debugging" modal appears once per Chrome session; subsequent commands reuse the daemon silently. The daemon lives until Chrome disconnects or you run `scripts/cdp.mjs stop`.
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
+
+For agent workflows, start with `inspect` for page state. Escalate to `snap` when you need the full accessibility tree, `html` when you need raw markup, and `shot` when visual layout matters. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands.
