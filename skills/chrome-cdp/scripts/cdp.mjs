@@ -20,6 +20,8 @@ const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const COMMAND_HISTORY_LIMIT = 50;
+const HTML_OUTPUT_LIMIT = 20000;
+const NET_ENTRY_LIMIT = 40;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
 const RUNTIME_DIR = IS_WINDOWS
@@ -235,6 +237,11 @@ function formatUptime(ms) {
   return `${seconds}s`;
 }
 
+function truncateText(text, maxLen) {
+  if (!text || text.length <= maxLen) return text;
+  return `${text.slice(0, maxLen)}\n\n... [truncated ${text.length - maxLen} chars]`;
+}
+
 function shouldShowAxNode(node, compact = false) {
   const role = node.role?.value || '';
   const name = node.name?.value ?? '';
@@ -352,10 +359,31 @@ async function shotStr(cdp, sid, filePath, targetId) {
 }
 
 async function htmlStr(cdp, sid, selector) {
-  const expr = selector
-    ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
-    : `document.documentElement.outerHTML`;
-  return evalStr(cdp, sid, expr);
+  const expr = `
+    (function() {
+      const selector = ${JSON.stringify(selector || '')};
+      const root = selector ? document.querySelector(selector) : document.documentElement;
+      if (!root) return { ok: false, error: 'Element not found: ' + selector };
+      const html = root.outerHTML || '';
+      return {
+        ok: true,
+        selector: selector || 'document.documentElement',
+        html,
+        truncated: html.length > ${HTML_OUTPUT_LIMIT},
+        totalLength: html.length,
+      };
+    })()
+  `;
+  const raw = await evalStr(cdp, sid, expr);
+  const data = JSON.parse(raw);
+  if (!data.ok) throw new Error(data.error);
+  const html = truncateText(data.html, HTML_OUTPUT_LIMIT);
+  if (!data.truncated) return html;
+  return [
+    `HTML scope: ${data.selector}`,
+    `HTML length: ${data.totalLength} chars`,
+    html,
+  ].join('\n');
 }
 
 function formatElementSummary(item) {
@@ -544,13 +572,29 @@ async function navStr(cdp, sid, url) {
 }
 
 async function netStr(cdp, sid) {
-  const raw = await evalStr(cdp, sid, `JSON.stringify(performance.getEntriesByType('resource').map(e => ({
-    name: e.name.substring(0, 120), type: e.initiatorType,
-    duration: Math.round(e.duration), size: e.transferSize
-  })))`);
-  return JSON.parse(raw).map(e =>
+  const raw = await evalStr(cdp, sid, `JSON.stringify((() => {
+    const entries = performance.getEntriesByType('resource')
+      .map(e => ({
+        name: e.name.substring(0, 120),
+        type: e.initiatorType || 'other',
+        duration: Math.round(e.duration),
+        size: e.transferSize || 0
+      }))
+      .sort((a, b) => b.duration - a.duration);
+    return {
+      total: entries.length,
+      entries: entries.slice(0, ${NET_ENTRY_LIMIT})
+    };
+  })())`);
+  const data = JSON.parse(raw);
+  const lines = data.entries.map(e =>
     `${String(e.duration).padStart(5)}ms  ${String(e.size || '?').padStart(8)}B  ${e.type.padEnd(8)}  ${e.name}`
-  ).join('\n');
+  );
+  if (data.total > data.entries.length) {
+    lines.unshift(`Showing slowest ${data.entries.length} of ${data.total} resource entries`);
+    lines.unshift('');
+  }
+  return lines.join('\n').trim();
 }
 
 // Click element by CSS selector
@@ -678,7 +722,8 @@ async function runBrowserDaemon() {
       const target = entry.targetId ? ` target=${entry.targetId.slice(0, 8)}` : '';
       const status = entry.ok ? 'ok' : 'error';
       const error = entry.error ? ` (${entry.error})` : '';
-      return `  - ${entry.cmd}${target}: ${formatDuration(entry.durationMs)} ${status}${error}`;
+      const size = entry.resultBytes != null ? ` ${entry.resultBytes}B` : '';
+      return `  - ${entry.cmd}${target}: ${formatDuration(entry.durationMs)}${size} ${status}${error}`;
     };
 
     lines.push('');
@@ -855,6 +900,7 @@ async function runBrowserDaemon() {
         cmd: req.cmd,
         targetId: req.targetId,
         durationMs: Date.now() - started,
+        resultBytes: Buffer.byteLength(String(res.result || ''), 'utf8'),
         ok: !!res.ok,
         error: res.ok ? '' : String(res.error || '').slice(0, 120),
       });
@@ -999,6 +1045,14 @@ async function stopDaemon() {
   }
 }
 
+async function refreshPagesCache() {
+  const conn = await getOrStartBrowserDaemon();
+  const raw = await sendCommand(conn, { cmd: 'list_raw', args: [] });
+  if (!raw.ok) throw new Error(raw.error || 'Failed to refresh page list');
+  writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
+  return JSON.parse(raw.result);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1013,9 +1067,9 @@ Usage: cdp <command> [args]
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
-  html  <target> [selector]         Get HTML (full page or CSS selector)
+  html  <target> [selector]         Get HTML (scoped when selector is provided; truncates large output)
   nav   <target> <url>              Navigate to URL and wait for load completion
-  net   <target>                    Network performance entries
+  net   <target>                    Slowest network performance entries
   click   <target> <selector>       Click an element by CSS selector
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
@@ -1063,6 +1117,24 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','loadall','evalraw',
 ]);
 
+async function resolveTargetId(targetPrefix) {
+  let pages;
+  if (!existsSync(PAGES_CACHE)) {
+    pages = await refreshPagesCache();
+  } else {
+    pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
+  }
+
+  try {
+    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  } catch (error) {
+    const message = String(error?.message || '');
+    if (!/No target matching prefix/.test(message)) throw error;
+    pages = await refreshPagesCache();
+    return resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  }
+}
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
@@ -1077,10 +1149,7 @@ async function main() {
     const conn = await getOrStartBrowserDaemon();
     const response = await sendCommand(conn, { cmd: 'list', args: [] });
     if (!response.ok) { console.error('Error:', response.error); process.exit(1); }
-    // Also refresh cache via list_raw
-    const conn2 = await getOrStartBrowserDaemon();
-    const raw = await sendCommand(conn2, { cmd: 'list_raw', args: [] });
-    if (raw.ok) writeFileSync(PAGES_CACHE, raw.result, { mode: 0o600 });
+    await refreshPagesCache().catch(() => {});
     console.log(response.result);
     return;
   }
@@ -1125,12 +1194,7 @@ async function main() {
   }
 
   // Resolve prefix → full targetId from pages cache
-  if (!existsSync(PAGES_CACHE)) {
-    console.error('No page list cached. Run "cdp list" first.');
-    process.exit(1);
-  }
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  const targetId = await resolveTargetId(targetPrefix);
 
   const conn = await getOrStartBrowserDaemon();
 

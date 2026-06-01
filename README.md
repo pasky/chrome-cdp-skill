@@ -38,10 +38,10 @@ scripts/cdp.mjs stats                             # browser daemon health and re
 scripts/cdp.mjs inspect <target> [".selector"]    # lightweight page summary
 scripts/cdp.mjs shot   <target>                   # screenshot → runtime dir
 scripts/cdp.mjs snap   <target>                   # accessibility tree (compact, semantic)
-scripts/cdp.mjs html   <target> [".selector"]     # full HTML or scoped to CSS selector
+scripts/cdp.mjs html   <target> [".selector"]     # scoped HTML, truncated when large
 scripts/cdp.mjs eval   <target> "expression"      # evaluate JS in page context
 scripts/cdp.mjs nav    <target> https://...       # navigate and wait for load
-scripts/cdp.mjs net    <target>                   # network resource timing
+scripts/cdp.mjs net    <target>                   # slowest network resource timing entries
 scripts/cdp.mjs click  <target> "selector"        # click element by CSS selector
 scripts/cdp.mjs clickxy <target> <x> <y>          # click at CSS pixel coordinates
 scripts/cdp.mjs type   <target> "text"            # type at focused element (works in cross-origin iframes)
@@ -63,4 +63,4 @@ Connects directly to Chrome's remote debugging WebSocket — no Puppeteer, no in
 
 This approach is also why it handles 100+ open tabs reliably, where tools built on Puppeteer often time out during target enumeration.
 
-For agent workflows, start with `inspect` for page state. Escalate to `snap` when you need the full accessibility tree, `html` when you need raw markup, and `shot` when visual layout matters. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands.
+For agent workflows, start with `inspect` for page state. Prefer scoped `html` and one combined `eval` before escalating to `snap` or `shot`. Use `stats` when diagnosing slow local automation or checking whether the browser daemon is accumulating slow commands or oversized responses.

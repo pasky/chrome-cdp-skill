@@ -44,7 +44,7 @@ scripts/cdp.mjs snap <target>
 scripts/cdp.mjs inspect <target> [selector]
 ```
 
-Use `inspect` first for page state: title, URL, ready state, focus, visible controls, links, inputs, forms, headings, and a bounded text sample. Escalate to `snap` for full accessibility structure, `html` for raw markup, or `shot` for visual evidence.
+Use `inspect` first for page state: title, URL, ready state, focus, visible controls, links, inputs, forms, headings, and a bounded text sample. Prefer scoped `html` or one combined `eval` before escalating to `snap` for full accessibility structure or `shot` for visual evidence.
 
 ### Daemon stats
 
@@ -65,10 +65,10 @@ scripts/cdp.mjs eval <target> <expr>
 ### Other commands
 
 ```bash
-scripts/cdp.mjs html    <target> [selector]   # full page or element HTML
+scripts/cdp.mjs html    <target> [selector]   # scoped HTML, truncated when large
 scripts/cdp.mjs inspect <target> [selector]   # lightweight page summary
 scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
-scripts/cdp.mjs net     <target>               # resource timing entries
+scripts/cdp.mjs net     <target>               # slowest resource timing entries
 scripts/cdp.mjs click   <target> <selector>    # click element by CSS selector
 scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
@@ -91,7 +91,8 @@ CSS px = screenshot image px / DPR
 
 ## Tips
 
-- Prefer `inspect` for first-pass page state; use `snap` only when you need the full accessibility tree.
+- Prefer `inspect` for first-pass page state; use scoped `html` or one combined `eval` before reaching for `snap` or `shot`.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Prefer one combined `eval` over many small `eval` calls when collecting structured page data.
+- Use `stats` to spot commands that return unusually large payloads, not just slow ones.
 - Chrome shows an "Allow debugging" modal once per Chrome session. A background browser daemon keeps the CDP connection alive so subsequent commands need no further approval until Chrome disconnects or you run `stop`.
