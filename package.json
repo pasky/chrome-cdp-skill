@@ -1,6 +1,6 @@
 {
   "name": "pi-chrome-cdp",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Give your AI agent access to your live Chrome session — works out of the box, connects to tabs you already have open",
   "keywords": [
     "pi-package",
