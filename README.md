@@ -30,6 +30,10 @@ Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's i
 
 The CLI auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux, and Windows. If your browser stores `DevToolsActivePort` in a non-standard location, set the `CDP_PORT_FILE` environment variable to the full path.
 
+### Termux (Android) setup
+
+See [TERMUX.md](TERMUX.md) for running chrome-cdp with headless Chromium on Termux. Key differences: set `CDP_PORT` instead of relying on `DevToolsActivePort` auto-detection, and use `chromium-browser --headless --no-sandbox`. Playwright does not work on Android.
+
 ## Usage
 
 ```bash
